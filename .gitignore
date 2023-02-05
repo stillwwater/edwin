@@ -1,0 +1,9 @@
+.vs/
+*.exe
+*.pdb
+*.ilk
+*.manifest
+*.cache
+*.obj
+*.o
+compile_commands.json
