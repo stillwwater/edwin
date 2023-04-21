@@ -1,5 +1,4 @@
 #include "edwin.h"
-
 #include <assert.h>
 #include <malloc.h>
 #include <math.h>
@@ -35,25 +34,24 @@ struct ed_color_picker {
     float original_color[4];
 };
 
+ed_node ed_tree[ED_NODE_COUNT];
+ed_node_update ed_update_funcs[ED_UPDATE_FUNCS_COUNT];
 struct ed_style ed_style;
 struct ed_stats ed_stats;
 
-ed_node ed_tree[ED_NODE_COUNT];
 static unsigned used_node_count;
 static unsigned active_node_count;
-static ed_tree_context ed_ctx;
-static ed_tree_context ed_saved_ctx;
-
-ed_node_update ed_update_funcs[ED_UPDATE_FUNCS_COUNT];
 static unsigned registered_update_count;
-
+static unsigned rect_stack_count;
+static ed_rect rect_stack[ED_RECT_STACK_SIZE];
 static HBRUSH brushes[ED_COLOR_COUNT];
 static HFONT ui_font;
-
-static ed_color_picker color_picker;
+static struct ed_tree_context ed_ctx;
+static struct ed_tree_context ed_saved_ctx;
+static struct ed_color_picker color_picker;
 
 static ed_node *
-ed_alloc_node()
+ed_alloc_node(void)
 {
     ed_node *node;
     if (ed_ctx.removed) {
@@ -101,12 +99,15 @@ ed_destroy_node(ed_node *node)
 }
 
 static ed_node *
-ed_attach(ed_node_type type, ed_rect rect)
+ed_attach(ed_node_type type, float x, float y, float w, float h)
 {
     assert(ed_ctx.parent && "cannot add child node without a parent.");
     ed_node *node = ed_alloc_node();
     node->type = type;
-    node->rect = rect;
+    node->rect.x = x;
+    node->rect.y = y;
+    node->rect.w = w;
+    node->rect.h = h;
     node->parent = ed_ctx.parent;
 
     if (!ed_ctx.parent->child) {
@@ -124,16 +125,16 @@ ed_attach(ed_node_type type, ed_rect rect)
 }
 
 static ed_node *
-ed_push(ed_node_type type, ed_rect rect)
+ed_push(ed_node_type type, float x, float y, float w, float h)
 {
-    ed_node *node = ed_attach(type, rect);
+    ed_node *node = ed_attach(type, x, y, w, h);
     ed_ctx.parent = node;
     ed_ctx.child = NULL;
     return node;
 }
 
 static void
-ed_pop()
+ed_pop(void)
 {
     assert(ed_ctx.parent);
     int pop_parent = ed_ctx.parent->flags & ED_POPPARENT;
@@ -158,7 +159,7 @@ ed_pop()
 // skip_first:
 //   Skip the node passed in to `node`.
 static ed_node *
-ed_find_node_with_flags(ed_node *node, int mask, bool skip_first = false)
+ed_find_node_with_flags(ed_node *node, int mask, bool skip_first)
 {
     size_t start = skip_first ? node->id + 1 : node->id;
     for (size_t i = start; i < ARRAYSIZE(ed_tree); ++i) {
@@ -174,19 +175,19 @@ ed_find_node_with_flags(ed_node *node, int mask, bool skip_first = false)
 // skip_first:
 //   Skip the node passed in to `node`.
 static ed_node *
-ed_find_node_with_flags_ordered(ed_node *node, int mask, bool skip_first = false)
+ed_find_node_with_flags_ordered(ed_node *node, int mask, bool skip_first)
 {
     if ((node->flags & mask) && !skip_first) {
         return node;
     }
 
     for (ed_node *c = node->child; c; c = c->after) {
-        ed_node *next = ed_find_node_with_flags_ordered(c, mask);
+        ed_node *next = ed_find_node_with_flags_ordered(c, mask, false);
         if (next) return next;
     }
 
     if (node->after) {
-        return ed_find_node_with_flags_ordered(node->after, mask);
+        return ed_find_node_with_flags_ordered(node->after, mask, false);
     }
 
     while (node->parent && !node->parent->after) {
@@ -194,7 +195,7 @@ ed_find_node_with_flags_ordered(ed_node *node, int mask, bool skip_first = false
     }
 
     if (node->parent) {
-        return ed_find_node_with_flags_ordered(node->parent->after, mask);
+        return ed_find_node_with_flags_ordered(node->parent->after, mask, false);
     }
 
     return NULL;
@@ -206,7 +207,7 @@ ed_find_node_with_flags_ordered(ed_node *node, int mask, bool skip_first = false
 // skip_first:
 //   Skip the node passed in to `node`.
 static ed_node *
-ed_rfind_node_with_flags(ed_node *node, int mask, bool skip_first = false)
+ed_rfind_node_with_flags(ed_node *node, int mask, bool skip_first)
 {
     int start = skip_first ? node->id - 1 : node->id;
     for (int i = start; i >= 0; --i) {
@@ -223,7 +224,7 @@ ed_rfind_node_with_flags(ed_node *node, int mask, bool skip_first = false)
 // skip_first:
 //   Skip the node passed in to `node`.
 static ed_node *
-ed_rfind_node_with_flags_ordered(ed_node *node, int mask, bool skip_first = false)
+ed_rfind_node_with_flags_ordered(ed_node *node, int mask, bool skip_first)
 {
     if ((node->flags & mask) && !skip_first) {
         return node;
@@ -235,13 +236,13 @@ ed_rfind_node_with_flags_ordered(ed_node *node, int mask, bool skip_first = fals
             if (!c->after) break;
         }
         for (; c; c = c->before) {
-            ed_node *previous = ed_rfind_node_with_flags_ordered(c, mask);
+            ed_node *previous = ed_rfind_node_with_flags_ordered(c, mask, false);
             if (previous) return previous;
         }
     }
 
     if (node->before) {
-        return ed_rfind_node_with_flags_ordered(node->before, mask);
+        return ed_rfind_node_with_flags_ordered(node->before, mask, false);
     }
 
     while (node->parent && !node->parent->before) {
@@ -249,7 +250,7 @@ ed_rfind_node_with_flags_ordered(ed_node *node, int mask, bool skip_first = fals
     }
 
     if (node->parent) {
-        return ed_rfind_node_with_flags_ordered(node->parent->before, mask);
+        return ed_rfind_node_with_flags_ordered(node->parent->before, mask, false);
     }
 
     return NULL;
@@ -258,14 +259,14 @@ ed_rfind_node_with_flags_ordered(ed_node *node, int mask, bool skip_first = fals
 static void
 ed_measure_text_bounds(ed_node *node)
 {
-    int len = GetWindowTextLength(ed_hwnd(node));
+    int len = GetWindowTextLengthA(ed_hwnd(node));
     char *text = (char *)_malloca(len + 1);
 
     SIZE ext;
     HDC hdc = GetDC(ed_hwnd(node));
-    GetWindowText(ed_hwnd(node), text, len + 1);
+    GetWindowTextA(ed_hwnd(node), text, len + 1);
 
-    if (GetTextExtentPoint32(hdc, text, len, &ext)) {
+    if (GetTextExtentPoint32A(hdc, text, len, &ext)) {
         node->bounds.w = (short)ext.cx;
         node->bounds.h = (short)ext.cy;
     }
@@ -314,17 +315,17 @@ static void
 ed_measure(ed_node *node)
 {
     if (!ed_is_visible(node)) {
-        node->dst = {};
+        memset(&node->dst, 0, sizeof node->dst);
         return;
     }
 
     ed_node *p = node->parent;
     ed_node *b = node->before;
 
-    node->dst = {
-        (short)node->rect.x, (short)node->rect.y,
-        (short)node->rect.w, (short)node->rect.h,
-    };
+    node->dst.x = (short)node->rect.x;
+    node->dst.y = (short)node->rect.y;
+    node->dst.w = (short)node->rect.w;
+    node->dst.h = (short)node->rect.h;
 
     // Parent padding
     if (p) {
@@ -397,8 +398,9 @@ ed_measure(ed_node *node)
         }
     }
 
-    if (ed_node *c = node->child) {
-        node->bounds = {};
+    ed_node *c = node->child;
+    if (c) {
+        memset(&node->bounds, 0, sizeof node->bounds);
 
         for (;; c = c->after) {
             ed_measure(c);
@@ -495,7 +497,7 @@ ed_layout(ed_node *node)
                 client->scroll_pos = client->bounds.h - client->dst.h;
             }
 
-            SCROLLINFO si = {};
+            SCROLLINFO si = {0};
             si.cbSize = sizeof(si);
             si.fMask = SIF_ALL;
             si.nMax = client->bounds.h;
@@ -521,28 +523,28 @@ ed_invalidate_scalar(ed_node *node)
     switch (node->value_type) {
     case ED_INT:
         snprintf(buf, sizeof buf, fmt, ed_read_value(int, node->value_ptr));
-        SetWindowText(ed_hwnd(node), buf);
+        SetWindowTextA(ed_hwnd(node), buf);
         break;
     case ED_FLOAT:
         snprintf(buf, sizeof buf, fmt, ed_read_value(float, node->value_ptr));
-        SetWindowText(ed_hwnd(node), buf);
+        SetWindowTextA(ed_hwnd(node), buf);
         break;
     case ED_INT64:
         snprintf(buf, sizeof buf, fmt, ed_read_value(long long, node->value_ptr));
-        SetWindowText(ed_hwnd(node), buf);
+        SetWindowTextA(ed_hwnd(node), buf);
         break;
     case ED_FLOAT64:
         snprintf(buf, sizeof buf, fmt, ed_read_value(double, node->value_ptr));
-        SetWindowText(ed_hwnd(node), buf);
+        SetWindowTextA(ed_hwnd(node), buf);
         break;
     case ED_ENUM:
-        SendMessage(ed_hwnd(node), CB_SETCURSEL, ed_read_value(int, node->value_ptr), 0);
+        SendMessageA(ed_hwnd(node), CB_SETCURSEL, ed_read_value(int, node->value_ptr), 0);
         break;
     case ED_FLAGS:
         InvalidateRect(ed_hwnd(node), NULL, TRUE);
         break;
     case ED_BOOL:
-        SendMessage(ed_hwnd(node), BM_SETCHECK, ed_read_value(bool, node->value_ptr), 0);
+        SendMessageA(ed_hwnd(node), BM_SETCHECK, ed_read_value(bool, node->value_ptr), 0);
         break;
     default:
         assert(!"ed_invalidate_scalar expected a scalar value type.");
@@ -559,9 +561,9 @@ ed_data_string(ed_node *node, void *value, size_t size)
     }
 
     if (value == node->value_ptr && size == node->value_size) {
-        int text_size = GetWindowTextLength(ed_hwnd(node)) + 1;
+        int text_size = GetWindowTextLengthA(ed_hwnd(node)) + 1;
         char *text = (char *)_malloca(text_size);
-        GetWindowText(ed_hwnd(node), text, text_size);
+        GetWindowTextA(ed_hwnd(node), text, text_size);
 
         size_t max_count = node->value_size ? node->value_size : text_size;
         if (!strncmp(text, (char *)value, max_count)) {
@@ -576,7 +578,7 @@ ed_data_string(ed_node *node, void *value, size_t size)
     node->value_size = size;
     node->value_ptr = value;
 
-    SetWindowText(ed_hwnd(node), (char *)node->value_ptr);
+    SetWindowTextA(ed_hwnd(node), (char *)node->value_ptr);
 }
 
 static void
@@ -666,7 +668,7 @@ ed_next_tabstop(ed_node *node)
         node = ed_find_node_with_flags_ordered(node, ED_TABSTOP, true);
         if (!node && !wrapped) {
             // Cycle to first tabstop.
-            node = ed_find_node_with_flags(ed_index_node(ED_ID_ROOT), ED_TABSTOP);
+            node = ed_find_node_with_flags(ed_index_node(ED_ID_ROOT), ED_TABSTOP, false);
             wrapped = true;
         }
     } while (node && (!ed_is_visible(node) || !ed_is_enabled(node)));
@@ -683,7 +685,7 @@ ed_previous_tabstop(ed_node *node)
         if (!node && !wrapped) {
             // Cycle to last tabstop.
             node = ed_rfind_node_with_flags(
-                    ed_index_node((short)used_node_count), ED_TABSTOP);
+                    ed_index_node((short)used_node_count), ED_TABSTOP, false);
             wrapped = true;
         }
     } while (node && (!ed_is_visible(node) || !ed_is_enabled(node)));
@@ -719,14 +721,14 @@ ed_file_extension(const char *filename)
 static HICON
 ed_load_icon(const char *filename, int *w, int *h)
 {
-    HICON hicon = (HICON)LoadImage(NULL, filename, IMAGE_ICON, *w, *h, LR_LOADFROMFILE);
+    HICON hicon = (HICON)LoadImageA(NULL, filename, IMAGE_ICON, *w, *h, LR_LOADFROMFILE);
     assert(hicon && "failed to load icon.");
 
     if (*w == 0 || *h == 0) {
         ICONINFO info;
         if (GetIconInfo(hicon, &info)) {
             BITMAP bm;
-            if (GetObject(info.hbmMask, sizeof bm, &bm) == sizeof(bm)) {
+            if (GetObjectA(info.hbmMask, sizeof bm, &bm) == sizeof(bm)) {
                 *w = bm.bmWidth;
                 *h = bm.bmHeight;
 
@@ -747,13 +749,13 @@ ed_load_icon(const char *filename, int *w, int *h)
 static HBITMAP
 ed_load_bitmap(const char *filename, int *w, int *h)
 {
-    HBITMAP hbm = (HBITMAP)LoadImage(NULL, filename, IMAGE_BITMAP, *w, *h,
+    HBITMAP hbm = (HBITMAP)LoadImageA(NULL, filename, IMAGE_BITMAP, *w, *h,
             LR_LOADFROMFILE);
     assert(hbm && "failed to load bitmap.");
 
     if (*w == 0 || *h == 0) {
         BITMAP bm;
-        if (GetObject(hbm, sizeof bm, &bm) == sizeof(bm)) {
+        if (GetObjectA(hbm, sizeof bm, &bm) == sizeof(bm)) {
             *w = bm.bmWidth;
             *h = bm.bmHeight;
         }
@@ -793,7 +795,7 @@ ed_alloc_bitmap_buffer(ed_node *node,
     buffer.h = (short)ed_abs(h);
     ed_write_value(ed_bitmap_buffer, node->value, &buffer);
 
-    BITMAPINFO bmi = {};
+    BITMAPINFO bmi = {0};
     bmi.bmiHeader.biSize        = sizeof(bmi.bmiHeader);
     bmi.bmiHeader.biWidth       = w;
     bmi.bmiHeader.biHeight      = h;
@@ -878,7 +880,7 @@ ed_pack_rgb(float *rgb)
 }
 
 static void
-ed_update_color_picker_slice()
+ed_update_color_picker_slice(void)
 {
     float rgb[3];
     float hsv[3];
@@ -901,7 +903,7 @@ ed_update_color_picker_slice()
 }
 
 static void
-ed_init_color_picker_hue()
+ed_init_color_picker_hue(void)
 {
     float rgb[3];
     float hsv[3];
@@ -923,8 +925,10 @@ ed_init_color_picker_hue()
 }
 
 static void
-ed_color_picker_rgba_on_change(ed_node *)
+ed_color_picker_rgba_on_change(ed_node *node)
 {
+    (void)node;
+
     ed_hsv_from_rgb(color_picker.hsv, color_picker.rgba);
     ed_update_color_picker_slice();
     InvalidateRect(ed_hwnd(color_picker.hue), NULL, FALSE);
@@ -945,7 +949,7 @@ ed_color_picker_hex_on_change(ed_node *node)
         return;
     }
 
-    constexpr float one_over_255 = 1.0f / 255.0f;
+    const float one_over_255 = 1.0f / 255.0f;
     color_picker.rgba[0] = ((change >> 16) & 0xFF) * one_over_255;
     color_picker.rgba[1] = ((change >> 8)  & 0xFF) * one_over_255;
     color_picker.rgba[2] = ((change >> 0)  & 0xFF) * one_over_255;
@@ -959,8 +963,10 @@ ed_color_picker_hex_on_change(ed_node *node)
 }
 
 static void
-ed_color_picker_revert(ed_node *)
+ed_color_picker_revert(ed_node *node)
 {
+    (void)node;
+
     memcpy(color_picker.rgba, color_picker.original_color, 4 * sizeof(float));
     color_picker.rgb_packed = ed_pack_rgb(color_picker.rgba);
     ed_hsv_from_rgb(color_picker.hsv, color_picker.rgba);
@@ -976,19 +982,20 @@ ed_color_picker_revert(ed_node *)
 static void
 ed_open_color_picker(ed_node *node)
 {
-    auto color_rgba = [] (const char *label) {
-        ed_node *input;
-        ed_begin({0, 0, 1, 0}, ED_HORZ)->spacing = ed_style.spacing / 2;
-        {
-            ed_label(label, {0, 0, 16, 24})->spacing = 0;
-            input = ed_float(NULL, 0, 1, NULL, {0, 0, 1, 24});
-            input->spacing = 0;
-            input->onchange = ed_color_picker_rgba_on_change;
-        }
-        ed_end();
-
-        return input;
-    };
+#define color_rgba(input, label)                                       \
+    {                                                                  \
+        ed_begin(ED_HORZ, 0, 0, 1, 0)->spacing = ed_style.spacing / 2; \
+        {                                                              \
+            ed_push_rect(0, 0, 16, 24);                                \
+            ed_label(label)->spacing = 0;                              \
+                                                                       \
+            ed_push_rect(0, 0, 1, ed_style.input_height);              \
+            input = ed_float(NULL, 0, 1);                              \
+            input->spacing = 0;                                        \
+            input->onchange = ed_color_picker_rgba_on_change;          \
+        }                                                              \
+        ed_end();                                                      \
+    }
 
     RECT rect = {0, 0, 280, 406};
     AdjustWindowRect(&rect, WS_CAPTION | WS_SYSMENU, FALSE);
@@ -997,18 +1004,18 @@ ed_open_color_picker(ed_node *node)
     GetWindowRect(ed_hwnd(node), &node_rect);
 
     if (!color_picker.dialog || color_picker.dialog->type == ED_NONE) {
-        HWND hwnd = CreateWindow("ED_USERWINDOW", "Color Picker",
+        HWND hwnd = CreateWindowA("ED_USERWINDOW", "Color Picker",
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
                 node_rect.right - rect.right, node_rect.top + node->dst.h,
                 rect.right - rect.left, rect.bottom - rect.top,
-                NULL, NULL, GetModuleHandle(NULL), NULL);
+                NULL, NULL, GetModuleHandleA(NULL), NULL);
 
         ed_begin_context(ed_index_node(ED_ID_ROOT));
         color_picker.dialog = ed_begin_hwnd(hwnd, ED_VERT);
         {
-            ed_begin({0, 0, 280, 256}, ED_HORZ);
+            ed_begin(ED_HORZ, 0, 0, 280, 256);
             {
-                color_picker.hue = ed_attach(ED_IMAGE, {0, 0, 24, 256});
+                color_picker.hue = ed_attach(ED_IMAGE, 0, 0, 24, 256);
                 ed_attach_hwnd(color_picker.hue, "ED_COLOR_HUE",
                         NULL, WS_CHILD | WS_VISIBLE);
                 color_picker.hue->value_type = ED_DIB;
@@ -1016,7 +1023,7 @@ ed_open_color_picker(ed_node *node)
                 ed_alloc_bitmap_buffer(color_picker.hue, NULL, 1, 256, ED_BGRA);
                 ed_init_color_picker_hue();
 
-                color_picker.slice = ed_attach(ED_IMAGE, {0, 0, 256, 256});
+                color_picker.slice = ed_attach(ED_IMAGE, 0, 0, 256, 256);
                 ed_attach_hwnd(color_picker.slice, "ED_COLOR_SLICE",
                         NULL, WS_CHILD | WS_VISIBLE);
                 color_picker.slice->value_type = ED_DIB;
@@ -1025,25 +1032,30 @@ ed_open_color_picker(ed_node *node)
             }
             ed_end();
 
-            ed_begin({0, 0, 280, 300}, ED_VERT)->padding = ed_style.padding;
+            ed_begin(ED_VERT, 0, 0, 280, 300)->padding = ed_style.padding;
             {
-                ed_node *r_node = color_rgba("R");
-                ed_node *g_node = color_rgba("G");
-                ed_node *b_node = color_rgba("B");
-                ed_node *a_node = color_rgba("A");
+                ed_node *r_node, *g_node, *b_node, *a_node;
+                color_rgba(r_node, "R");
+                color_rgba(g_node, "G");
+                color_rgba(b_node, "B");
+                color_rgba(a_node, "A");
 
                 r_node->node_list = g_node;
                 g_node->node_list = b_node;
                 b_node->node_list = a_node;
                 color_picker.rgba_slider = r_node;
 
-                ed_begin({1, 0, 160, 0}, ED_HORZ)->spacing = ed_style.spacing / 2;
+                ed_begin(ED_HORZ, 1, 0, 160, 0)->spacing = ed_style.spacing / 2;
                 {
-                    ed_node *revert = ed_button("Revert", NULL, {0, 0, 0, 24});
+                    ed_push_rect(0, 0, 0, 24);
+                    ed_node *revert = ed_button("Revert", NULL);
                     revert->onclick = ed_color_picker_revert;
 
-                    ed_label("#", {0, 0, 12, 24})->spacing = 0;
-                    color_picker.rgb_hex = ed_int(NULL, 0, 0, "%06X", 16, {0, 0, 1, 24});
+                    ed_push_rect(0, 0, 12, 24);
+                    ed_label("#")->spacing = 0;
+
+                    ed_push_rect(0, 0, 1, 24);
+                    color_picker.rgb_hex = ed_int_fmt(NULL, 0, 0, "%06X", 16);
                     color_picker.rgb_hex->spacing = 0;
                     color_picker.rgb_hex->onchange = ed_color_picker_hex_on_change;
                 }
@@ -1079,7 +1091,7 @@ ed_open_color_picker(ed_node *node)
 static LRESULT __stdcall
 ed_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
-    ed_node *node = (ed_node *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    ed_node *node = (ed_node *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
     switch (msg) {
     case WM_DRAWITEM: {
@@ -1100,7 +1112,7 @@ ed_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
                     char buf[19] = {0};
                     snprintf(buf, sizeof buf, "0x%llX", value);
 
-                    DrawText(dis->hDC, buf, (int)(sizeof(buf) - 1), &dis->rcItem,
+                    DrawTextA(dis->hDC, buf, (int)(sizeof(buf) - 1), &dis->rcItem,
                             DT_SINGLELINE | DT_VCENTER);
                     return 1;
                 }
@@ -1109,7 +1121,7 @@ ed_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 
                 assert(dis->itemID < 64);
                 unsigned long long mask = 1ULL << dis->itemID;
-                const char *text = (const char *)SendMessage(ed_hwnd(item),
+                const char *text = (const char *)SendMessageA(ed_hwnd(item),
                         CB_GETITEMDATA, dis->itemID, 0);
                 size_t len = strlen(text);
 
@@ -1123,7 +1135,7 @@ ed_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
                     DrawFrameControl(dis->hDC, &cb_rect, DFC_BUTTON, DFCS_BUTTONCHECK);
                 }
 
-                DrawText(dis->hDC, text, (int)len, &dis->rcItem,
+                DrawTextA(dis->hDC, text, (int)len, &dis->rcItem,
                         DT_SINGLELINE | DT_VCENTER);
             }
         }
@@ -1145,7 +1157,7 @@ ed_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         if (node && node->type == ED_SCROLLBLOCK) {
             ed_node *client = node->child;
             int scroll_lines;
-            SystemParametersInfo(SPI_GETWHEELSCROLLLINES, 0, &scroll_lines, 0);
+            SystemParametersInfoA(SPI_GETWHEELSCROLLLINES, 0, &scroll_lines, 0);
 
             int delta = (GET_WHEEL_DELTA_WPARAM(wparam) / WHEEL_DELTA) * scroll_lines;
             ed_set_scroll_position(client,
@@ -1171,11 +1183,11 @@ ed_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         break;
     }
     case WM_COMMAND: {
-        ed_node *c = (ed_node *)GetWindowLongPtr((HWND)lparam, GWLP_USERDATA);
+        ed_node *c = (ed_node *)GetWindowLongPtrA((HWND)lparam, GWLP_USERDATA);
 
         switch (HIWORD(wparam)) {
         case CBN_SELCHANGE: {
-            int selected = (int)SendMessage(ed_hwnd(c), CB_GETCURSEL, 0, 0);
+            int selected = (int)SendMessageA(ed_hwnd(c), CB_GETCURSEL, 0, 0);
             if (c->value_ptr && selected != -1) {
                 if (c->value_type == ED_ENUM) {
                     ed_write_value(int, c->value, &selected);
@@ -1195,7 +1207,7 @@ ed_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         }
         case BN_CLICKED: {
             if (c->type == ED_CHECKBOX && c->value_ptr) {
-                int state = (int)SendMessage(ed_hwnd(c), BM_GETCHECK, 0, 0);
+                int state = (int)SendMessageA(ed_hwnd(c), BM_GETCHECK, 0, 0);
 
                 // Call ed_data to initialize the node.
                 assert(state != BST_INDETERMINATE);
@@ -1205,7 +1217,7 @@ ed_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 
                 if (c->onchange) c->onchange(c);
                 memcpy(c->value_ptr, c->value, c->value_size);
-                SendMessage(ed_hwnd(c), BM_SETCHECK, current_value, 0);
+                SendMessageA(ed_hwnd(c), BM_SETCHECK, current_value, 0);
             } else if (c->type == ED_BUTTON) {
                 if (c->onclick) c->onclick(c);
             }
@@ -1215,13 +1227,13 @@ ed_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
     }
     }
 
-    return DefWindowProc(hwnd, msg, wparam, lparam);
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
 static LRESULT __stdcall
 ed_user_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
-    ed_node *node = (ed_node *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    ed_node *node = (ed_node *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
     switch (msg) {
     case WM_CLOSE:
@@ -1246,13 +1258,13 @@ ed_user_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
     }
     }
 
-    return DefWindowProc(hwnd, msg, wparam, lparam);
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
 static LRESULT __stdcall
 ed_caption_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
-    ed_node *node = (ed_node *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    ed_node *node = (ed_node *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
     ed_node *p = node ? node->parent : NULL;
 
     switch (msg) {
@@ -1264,7 +1276,7 @@ ed_caption_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         break;
     case WM_PAINT: {
         char name[256];
-        int len_name = GetWindowText(hwnd, name, sizeof(name));
+        int len_name = GetWindowTextA(hwnd, name, sizeof(name));
 
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
@@ -1274,7 +1286,7 @@ ed_caption_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         FillRect(hdc, &rect, brushes[ED_COLOR_HIGHLIGHT]);
 
         if (GetFocus() == hwnd) {
-            FrameRect(hdc, &rect, (HBRUSH)(COLOR_WINDOWFRAME + 1));
+            FrameRect(hdc, &rect, brushes[ED_COLOR_WINDOWTEXT]);
         }
         rect.left += ed_style.spacing;
 
@@ -1282,13 +1294,13 @@ ed_caption_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         SetTextColor(hdc, ed_style.colors[ED_COLOR_HIGHLIGHTTEXT]);
         if (p && (p->flags & ED_EXPAND)) {
             if (p->flags & ED_COLLAPSED) {
-                DrawText(hdc, "+", 1, &rect, DT_SINGLELINE | DT_VCENTER);
+                DrawTextA(hdc, "+", 1, &rect, DT_SINGLELINE | DT_VCENTER);
             } else {
-                DrawText(hdc, "-", 1, &rect, DT_SINGLELINE | DT_VCENTER);
+                DrawTextA(hdc, "-", 1, &rect, DT_SINGLELINE | DT_VCENTER);
             }
             rect.left += ed_style.spacing + ed_style.spacing / 2;
         }
-        DrawText(hdc, name, len_name, &rect, DT_SINGLELINE | DT_VCENTER);
+        DrawTextA(hdc, name, len_name, &rect, DT_SINGLELINE | DT_VCENTER);
         EndPaint(hwnd, &ps);
         return 1;
     }
@@ -1296,7 +1308,7 @@ ed_caption_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         if (!((wparam == VK_RETURN || wparam == VK_SPACE) && GetFocus() == hwnd)) {
             break;
         }
-        [[fallthrough]];
+        // fallthrough
     case WM_LBUTTONDOWN: {
         if (p && (p->flags & ED_EXPAND)) {
             p->flags ^= ED_COLLAPSED;
@@ -1308,13 +1320,13 @@ ed_caption_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
     }
     }
 
-    return DefWindowProc(hwnd, msg, wparam, lparam);
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
 static LRESULT __stdcall
 ed_image_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
-    ed_node *node = (ed_node *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    ed_node *node = (ed_node *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
     switch (msg) {
     case WM_NCHITTEST:
@@ -1358,13 +1370,13 @@ ed_image_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         break;
     }
 
-    return DefWindowProc(hwnd, msg, wparam, lparam);
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
 static LRESULT __stdcall
 ed_color_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
-    ed_node *node = (ed_node *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    ed_node *node = (ed_node *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
     switch (msg) {
     case WM_LBUTTONUP: {
@@ -1399,19 +1411,19 @@ ed_color_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
     }
     }
 
-    return DefWindowProc(hwnd, msg, wparam, lparam);
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
 static LRESULT __stdcall
 ed_color_slice_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
-    ed_node *node = (ed_node *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    ed_node *node = (ed_node *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
     switch (msg) {
     case WM_LBUTTONDOWN: {
         SetCapture(hwnd);
         ed_reset_focus(node);
-        [[fallthrough]];
+        // fallthrough
     }
     case WM_MOUSEMOVE: {
         if (GetKeyState(VK_LBUTTON) & 0x80) {
@@ -1475,19 +1487,19 @@ ed_color_slice_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
     }
     }
 
-    return DefWindowProc(hwnd, msg, wparam, lparam);
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
 static LRESULT __stdcall
 ed_color_hue_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
-    ed_node *node = (ed_node *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    ed_node *node = (ed_node *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
     switch (msg) {
     case WM_LBUTTONDOWN: {
         SetCapture(hwnd);
         ed_reset_focus(node);
-        [[fallthrough]];
+        // fallthrough
     }
     case WM_MOUSEMOVE: {
         if (GetKeyState(VK_LBUTTON) & 0x80) {
@@ -1538,30 +1550,33 @@ ed_color_hue_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
                 hue_hdc, 0, 0, buffer.w, buffer.h, SRCCOPY);
 
         HBRUSH tri_fill = CreateSolidBrush(RGB(0, 0, 0));
-        POINT tris[6];
-        INT index[] = {3, 3};
+        SelectObject(hdc, tri_fill);
 
+        INT index[] = {3, 3};
         if (buffer.h > buffer.w) {
             // Drawing this |> <|
             int cursor_y = (int)((1 - color_picker.hsv[0]) * buffer.h);
-            tris[0] = {0, cursor_y - 6};
-            tris[1] = {6, cursor_y};
-            tris[2] = {0, cursor_y + 6};
-            tris[3] = {rect.right - 1, cursor_y - 6};
-            tris[4] = {rect.right - 7, cursor_y};
-            tris[5] = {rect.right - 1, cursor_y + 6};
+            POINT tris[6] = {
+                {0, cursor_y - 6},
+                {6, cursor_y},
+                {0, cursor_y + 6},
+                {rect.right - 1, cursor_y - 6},
+                {rect.right - 7, cursor_y},
+                {rect.right - 1, cursor_y + 6},
+            };
+            PolyPolygon(hdc, tris, index, ARRAYSIZE(index));
         } else {
             int cursor_x = (int)(color_picker.hsv[0] * buffer.w);
-            tris[0] = {cursor_x - 6, 0};
-            tris[1] = {cursor_x, 6};
-            tris[2] = {cursor_x + 6, 0};
-            tris[3] = {cursor_x - 6, rect.bottom - 1};
-            tris[4] = {cursor_x, rect.bottom - 7};
-            tris[5] = {cursor_x + 6, rect.bottom - 1};
+            POINT tris[6] = {
+                {cursor_x - 6, 0},
+                {cursor_x, 6},
+                {cursor_x + 6, 0},
+                {cursor_x - 6, rect.bottom - 1},
+                {cursor_x, rect.bottom - 7},
+                {cursor_x + 6, rect.bottom - 1},
+            };
+            PolyPolygon(hdc, tris, index, ARRAYSIZE(index));
         }
-
-        SelectObject(hdc, tri_fill);
-        PolyPolygon(hdc, tris, index, ARRAYSIZE(index));
 
         DeleteDC(hue_hdc);
         DeleteObject(tri_fill);
@@ -1570,28 +1585,30 @@ ed_color_hue_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
     }
     }
 
-    return DefWindowProc(hwnd, msg, wparam, lparam);
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
 static LRESULT __stdcall
 ed_edit_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
-        UINT_PTR /* id */, DWORD_PTR /* data */)
+        UINT_PTR id, DWORD_PTR data)
 {
-    ed_node *node = (ed_node *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+#define write_number_value(Type, node, value, valid)                           \
+    {                                                                          \
+        if (valid) {                                                           \
+            Type val_min = ed_read_value(Type, node->value_min);               \
+            Type val_max = ed_read_value(Type, node->value_max);               \
+            if (val_min != val_max) value = ed_clamp(value, val_min, val_max); \
+            ed_write_value(Type, node->value, &value);                         \
+            if (node->onchange) node->onchange(node);                          \
+            ed_write_value(Type, node->value_ptr, node->value);                \
+        }                                                                      \
+        ed_invalidate_data(node);                                              \
+    }
 
-    auto write_number_value = [] (ed_node *node, auto value, bool valid) {
-        if (valid) {
-            auto val_min = ed_read_value(decltype(value), node->value_min);
-            auto val_max = ed_read_value(decltype(value), node->value_max);
+    (void)id;
+    (void)data;
 
-            if (val_min != val_max) value = ed_clamp(value, val_min, val_max);
-            ed_write_value(decltype(value), node->value, &value);
-
-            if (node->onchange) node->onchange(node);
-            ed_write_value(decltype(value), node->value_ptr, node->value);
-        }
-        ed_invalidate_data(node);
-    };
+    ed_node *node = (ed_node *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
     switch (msg) {
     case WM_CHAR:
@@ -1602,17 +1619,16 @@ ed_edit_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
         if (!(wparam == VK_RETURN)) {
             break;
         }
-
-        [[fallthrough]];
+        // fallthrough
     case WM_KILLFOCUS:
         if (node->value_ptr && !(node->flags & ED_READONLY)) {
             if (node->value_type == ED_STRING) {
                 if (node->value_size > 0) {
-                    size_t min_size = (size_t)(GetWindowTextLength(ed_hwnd(node)) + 1);
+                    size_t min_size = (size_t)(GetWindowTextLengthA(ed_hwnd(node)) + 1);
                     ed_write_value(size_t, node->value, &min_size);
 
                     if (node->onchange) node->onchange(node);
-                    GetWindowText(ed_hwnd(node),
+                    GetWindowTextA(ed_hwnd(node),
                             (char *)node->value_ptr, (int)node->value_size);
                 }
                 break;
@@ -1620,28 +1636,28 @@ ed_edit_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
 
             char buf[64];
             char *end;
-            int len = GetWindowText(ed_hwnd(node), buf, sizeof buf);
+            int len = GetWindowTextA(ed_hwnd(node), buf, sizeof buf);
             int base = ed_read_value(int, &node->value[8]);
 
             switch (node->value_type) {
             case ED_INT: {
                 int value = (int)strtol(buf, &end, base);
-                write_number_value(node, value, (end - buf) == len);
+                write_number_value(int, node, value, (end - buf) == len);
                 break;
             }
             case ED_FLOAT: {
                 float value = strtof(buf, &end);
-                write_number_value(node, value, (end - buf) == len);
+                write_number_value(float, node, value, (end - buf) == len);
                 break;
             }
             case ED_INT64: {
                 long long value = strtoll(buf, &end, base);
-                write_number_value(node, value, (end - buf) == len);
+                write_number_value(long long, node, value, (end - buf) == len);
                 break;
             }
             case ED_FLOAT64: {
                 double value = strtof(buf, &end);
-                write_number_value(node, value, (end - buf) == len);
+                write_number_value(double, node, value, (end - buf) == len);
                 break;
             }
             default:
@@ -1652,83 +1668,88 @@ ed_edit_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
     }
 
     if (msg == WM_CHAR && wparam == VK_RETURN) {
-        LONG style = GetWindowLong(hwnd, GWL_STYLE);
+        LONG style = GetWindowLongA(hwnd, GWL_STYLE);
         if (!(style & ES_MULTILINE)) {
             return 1;
         }
     }
 
     return DefSubclassProc(hwnd, msg, wparam, lparam);
+
+#undef write_number_value
 }
 
 static LRESULT __stdcall
 ed_number_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
-        UINT_PTR /* id */, DWORD_PTR /* data */)
+        UINT_PTR id, DWORD_PTR data)
 {
+#define set_editing(node, editing)                                       \
+    if ((bool)(node->flags & ED_EDITING) != editing) {                   \
+        if (editing) {                                                   \
+            node->flags |= ED_EDITING;                                   \
+            ShowCaret(ed_hwnd(node));                                    \
+        } else {                                                         \
+            node->flags &= ~ED_EDITING;                                  \
+            HideCaret(ed_hwnd(node));                                    \
+        }                                                                \
+        InvalidateRect(ed_hwnd(node), NULL, TRUE);                       \
+    }                                                                    \
+
+#define update_slider(Type, node, mouse_x, mouse_acc, delta_x)           \
+    {                                                                    \
+        Type value = ed_read_value(Type, node->value);                   \
+        Type val_min = ed_read_value(Type, node->value_min);             \
+        Type val_max = ed_read_value(Type, node->value_max);             \
+                                                                         \
+        if (mouse_acc > ed_style.number_input_deadzone) {                \
+            if (val_min != val_max) {                                    \
+                RECT rc;                                                 \
+                GetWindowRect(ed_hwnd(node), &rc);                       \
+                                                                         \
+                double t = mouse_x / (double)(rc.right - rc.left);       \
+                double d = (double)(val_max - val_min);                  \
+                Type slider_x = (Type)(val_min + d * t);                 \
+                value = ed_clamp(slider_x, val_min, val_max);            \
+            } else {                                                     \
+                value += delta_x;                                        \
+            }                                                            \
+        }                                                                \
+                                                                         \
+        ed_write_value(Type, node->value, &value);                       \
+        if (node->onchange) node->onchange(node);                        \
+                                                                         \
+        ed_write_value(Type, node->value_ptr, &value);                   \
+        ed_invalidate_data(node);                                        \
+    }
+
+#define fill_slider(Type, node, hdc, rc_slide)                           \
+    {                                                                    \
+        Type value = ed_read_value(Type, node->value);                   \
+        Type val_min = ed_read_value(Type, node->value_min);             \
+        Type val_max = ed_read_value(Type, node->value_max);             \
+        if (val_min != val_max) {                                        \
+            double t = (value - val_min) / (double)(val_max - val_min);  \
+            double w = (double)(rc_slider.right - rc_slider.left) * t;   \
+            int right_max = rc_slider.right;                             \
+            rc_slider.right = (int)(rc_slider.left + w);                 \
+            rc_slider.right = ed_min(rc_slider.right, right_max);        \
+            FillRect(hdc, &rc_slider, brushes[ED_COLOR_HIGHLIGHT]);      \
+        } else {                                                         \
+            rc_slider.right = rc_slider.left;                            \
+        }                                                                \
+    }
+
     static short last_mouse_x = 0;
     static int mouse_acc = 0;
 
-    ed_node *node = (ed_node *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    (void)id;
+    (void)data;
+
+    ed_node *node = (ed_node *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
     if ((node->flags & ED_READONLY) || !IsWindowEnabled(hwnd)) {
         return DefSubclassProc(hwnd, msg, wparam, lparam);
     }
-
-    auto set_editing = [] (ed_node *node, bool editing) {
-        if ((bool)(node->flags & ED_EDITING) != editing) {
-            if (editing) {
-                node->flags |= ED_EDITING;
-                ShowCaret(ed_hwnd(node));
-            } else {
-                node->flags &= ~ED_EDITING;
-                HideCaret(ed_hwnd(node));
-            }
-            InvalidateRect(ed_hwnd(node), NULL, TRUE);
-        }
-    };
-
-    auto update_slider = [] (ed_node *node, short mouse_x, int mouse_acc, auto delta_x) {
-        auto value = ed_read_value(decltype(delta_x), node->value);
-        auto val_min = ed_read_value(decltype(delta_x), node->value_min);
-        auto val_max = ed_read_value(decltype(delta_x), node->value_max);
-
-        if (mouse_acc > ed_style.number_input_deadzone) {
-            if (val_min != val_max) {
-                // Slider
-                RECT rc;
-                GetWindowRect(ed_hwnd(node), &rc);
-
-                double t = mouse_x / (double)(rc.right - rc.left);
-                auto slider_x = (decltype(delta_x))(val_min + ((double)(val_max - val_min) * t));
-                value = ed_clamp(slider_x, val_min, val_max);
-            } else {
-                // Unbound slider
-                value += delta_x;
-            }
-        }
-
-        ed_write_value(decltype(delta_x), node->value, &value);
-        if (node->onchange) node->onchange(node);
-
-        ed_write_value(decltype(delta_x), node->value_ptr, &value);
-        ed_invalidate_data(node);
-    };
-
-    auto fill_slider = [] (ed_node *node, HDC hdc, RECT *rc_slider, auto value) {
-        auto val_min = ed_read_value(decltype(value), node->value_min);
-        auto val_max = ed_read_value(decltype(value), node->value_max);
-
-        if (val_min != val_max) {
-            double t = (value - val_min) / (double)(val_max - val_min);
-            double w = (double)(rc_slider->right - rc_slider->left) * t;
-            int right_max = rc_slider->right;
-            rc_slider->right = (int)(rc_slider->left + w);
-            rc_slider->right = ed_min(rc_slider->right, right_max);
-            FillRect(hdc, rc_slider, brushes[ED_COLOR_HIGHLIGHT]);
-            return;
-        }
-        rc_slider->right = rc_slider->left;
-    };
 
     switch (msg) {
     case WM_LBUTTONDOWN: {
@@ -1744,7 +1765,7 @@ ed_number_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
             if (mouse_acc <= ed_style.number_input_deadzone) {
                 // Click on input node without sliding mouse over deadzone to edit.
                 set_editing(node, true);
-                SendMessage(hwnd, EM_SETSEL, 0, -1);
+                SendMessageA(hwnd, EM_SETSEL, 0, -1);
             } else {
                 // Outside of edit mode, the number slider only has temporary
                 // focus while active.
@@ -1758,8 +1779,8 @@ ed_number_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
         if (!(GetKeyState(VK_LBUTTON) & 0x80)) {
             // Right click to exit out of edit mode.
             set_editing(node, false);
-            SendMessage(hwnd, EM_SETSEL, 0, 0);
-            SetCursor(LoadCursor(NULL, IDC_ARROW));
+            SendMessageA(hwnd, EM_SETSEL, 0, 0);
+            SetCursor(LoadCursorA(NULL, IDC_ARROW));
             ed_reset_focus(node);
             return 1;
         }
@@ -1776,13 +1797,13 @@ ed_number_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
     }
     case ED_WM_TABSTOPSETFOCUS: {
         set_editing(node, true);
-        SendMessage(hwnd, EM_SETSEL, 0, -1);
+        SendMessageA(hwnd, EM_SETSEL, 0, -1);
         InvalidateRect(hwnd, NULL, TRUE);
         break;
     }
     case WM_SETCURSOR: {
         if (!(node->flags & ED_EDITING)) {
-            SetCursor(LoadCursor(NULL, IDC_ARROW));
+            SetCursor(LoadCursorA(NULL, IDC_ARROW));
             return 0;
         }
         break;
@@ -1799,17 +1820,17 @@ ed_number_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
 
             switch (node->value_type) {
             case ED_INT:
-                update_slider(node, mouse_x, mouse_acc, mouse_delta);
+                update_slider(int, node, mouse_x, mouse_acc, mouse_delta);
                 break;
             case ED_FLOAT:
-                update_slider(node, mouse_x, mouse_acc,
+                update_slider(float, node, mouse_x, mouse_acc,
                         (float)mouse_delta * ed_style.number_input_float_increment);
                 break;
             case ED_INT64:
-                update_slider(node, mouse_x, mouse_acc, (long long)mouse_delta);
+                update_slider(long long, node, mouse_x, mouse_acc, (long long)mouse_delta);
                 break;
             case ED_FLOAT64:
-                update_slider(node, mouse_x, mouse_acc,
+                update_slider(double, node, mouse_x, mouse_acc,
                         (double)mouse_delta * ed_style.number_input_float64_increment);
                 break;
             default:
@@ -1833,28 +1854,15 @@ ed_number_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
             HBITMAP hbm = CreateCompatibleBitmap(hdc, width, height);
             SelectObject(buf_hdc, hbm);
 
-            FillRect(buf_hdc, &rect, (HBRUSH)(COLOR_WINDOW + 1));
+            FillRect(buf_hdc, &rect, brushes[ED_COLOR_WINDOW]);
             RECT rc_slider = rect;
 
             switch (node->value_type) {
-            case ED_INT:
-                fill_slider(node, buf_hdc, &rc_slider,
-                        ed_read_value(int, node->value));
-                break;
-            case ED_FLOAT:
-                fill_slider(node, buf_hdc, &rc_slider,
-                        ed_read_value(float, node->value));
-                break;
-            case ED_INT64:
-                fill_slider(node, buf_hdc, &rc_slider,
-                        ed_read_value(long long, node->value));
-                break;
-            case ED_FLOAT64:
-                fill_slider(node, buf_hdc, &rc_slider,
-                        ed_read_value(double, node->value));
-                break;
-            default:
-                break;
+            case ED_INT: fill_slider(int, node, buf_hdc, rc_slider); break;
+            case ED_FLOAT: fill_slider(float, node, buf_hdc, rc_slider); break;
+            case ED_INT64: fill_slider(long long, node, buf_hdc, rc_slider); break;
+            case ED_FLOAT64: fill_slider(double, node, buf_hdc, rc_slider); break;
+            default: break;
             }
 
             FrameRect(buf_hdc, &rect, brushes[ED_COLOR_GRAYTEXT]);
@@ -1863,8 +1871,8 @@ ed_number_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
             SetTextColor(buf_hdc, ed_style.colors[ED_COLOR_WINDOWTEXT]);
             SetBkColor(buf_hdc, ed_style.colors[ED_COLOR_WINDOW]);
 
-            int len = GetWindowText(hwnd, buf, sizeof buf);
-            DrawText(buf_hdc, buf, len, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            int len = GetWindowTextA(hwnd, buf, sizeof buf);
+            DrawTextA(buf_hdc, buf, len, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
             if (rc_slider.right > rect.left) {
                 // Text covered by slider (invert color)
@@ -1875,7 +1883,7 @@ ed_number_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
                 SetTextColor(buf_hdc, ed_style.colors[ED_COLOR_HIGHLIGHTTEXT]);
                 SetBkColor(buf_hdc, ed_style.colors[ED_COLOR_HIGHLIGHT]);
 
-                DrawText(buf_hdc, buf, len, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                DrawTextA(buf_hdc, buf, len, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 DeleteObject(slider_rgn);
             }
 
@@ -1891,24 +1899,30 @@ ed_number_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
     }
 
     return DefSubclassProc(hwnd, msg, wparam, lparam);
+#undef set_editing
+#undef update_slider
+#undef fill_slider
 }
 
 static LRESULT __stdcall
 ed_tabstop_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
-        UINT_PTR /* id */, DWORD_PTR /* data */)
+        UINT_PTR id, DWORD_PTR data)
 {
     static bool vk_shift_down = false;
 
-    ed_node *node = (ed_node *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    (void)id;
+    (void)data;
+
+    ed_node *node = (ed_node *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
     switch (msg) {
     case WM_KEYDOWN: {
         if (wparam == VK_SHIFT) vk_shift_down = true;
         if (wparam == VK_RETURN || wparam == VK_SPACE) {
             if (node->type == ED_CHECKBOX) {
-                SendMessage(hwnd, BM_CLICK, 0, 0);
+                SendMessageA(hwnd, BM_CLICK, 0, 0);
             } else if (node->type == ED_COMBOBOX) {
-                SendMessage(hwnd, CB_SHOWDROPDOWN, 1, 0);
+                SendMessageA(hwnd, CB_SHOWDROPDOWN, 1, 0);
             }
             return 1;
         }
@@ -1929,7 +1943,7 @@ ed_tabstop_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
 
             if (tabstop) {
                 ed_set_focus(tabstop);
-                SendMessage(ed_hwnd(tabstop), ED_WM_TABSTOPSETFOCUS, 0, 0);
+                SendMessageA(ed_hwnd(tabstop), ED_WM_TABSTOPSETFOCUS, 0, 0);
             }
             return 1;
         }
@@ -1941,9 +1955,12 @@ ed_tabstop_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
 
 static LRESULT __stdcall
 ed_text_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
-        UINT_PTR /* id */, DWORD_PTR /* data */)
+        UINT_PTR id, DWORD_PTR data)
 {
-    ed_node *node = (ed_node *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    (void)id;
+    (void)data;
+
+    ed_node *node = (ed_node *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
     LRESULT result = DefSubclassProc(hwnd, msg, wparam, lparam);
 
     if (msg == WM_SETTEXT) {
@@ -1958,12 +1975,38 @@ ed_text_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
 static ATOM
 ed_register_class(const char *name, WNDPROC proc)
 {
-    WNDCLASS wnd_class = {};
+    WNDCLASSA wnd_class = {0};
     wnd_class.lpfnWndProc   = proc;
-    wnd_class.hInstance     = GetModuleHandle(NULL);
-    wnd_class.hCursor       = LoadCursor(NULL, IDC_ARROW);
+    wnd_class.hInstance     = GetModuleHandleA(NULL);
+    wnd_class.hCursor       = LoadCursorA(NULL, IDC_ARROW);
     wnd_class.lpszClassName = name;
-    return RegisterClass(&wnd_class);
+    return RegisterClassA(&wnd_class);
+}
+
+static ed_node *
+ed_input_basic(ed_value_type value_type)
+{
+    ed_rect rect = ed_pop_rect(0, 0, 1.0f, 0);
+    ed_node *node = ed_attach(ED_INPUT, rect.x, rect.y, rect.w, rect.h);
+    node->spacing = ed_style.spacing;
+    node->flags = ED_TABSTOP | ED_TEXTNODE;
+    node->value_type = value_type;
+    memset(&node->value, 0, sizeof node->value);
+
+    ed_attach_hwnd(node, "EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL);
+    ed_measure_text_bounds(node);
+    SetWindowSubclass(ed_hwnd(node), ed_edit_proc, 0, 0);
+    SetWindowSubclass(ed_hwnd(node), ed_tabstop_proc, 1, 0);
+    SetWindowSubclass(ed_hwnd(node), ed_text_proc, 2, 0);
+
+    if (node->value_type >= ED_VALUE_TYPE_NUMBER_MIN
+            && node->value_type <= ED_VALUE_TYPE_NUMBER_MAX) {
+        SetWindowSubclass(ed_hwnd(node), ed_number_proc, 3, 0);
+    }
+
+    // node->value_ptr starts by pointing to the internal value storage.
+    ed_data(node, node->value);
+    return node;
 }
 
 // Returns a node given a unique id.
@@ -1982,7 +2025,9 @@ ed_index_node(short id)
 }
 
 // Initializes the library.
-//   hwnd: the root window of the application.
+//
+// hwnd:
+//   The root window of the application.
 void
 ed_init(void *hwnd)
 {
@@ -1991,9 +2036,9 @@ ed_init(void *hwnd)
         return;
     }
 
-    ed_style = {};
-    ed_stats = {};
-    ed_ctx = {};
+    memset(&ed_style, 0, sizeof ed_style);
+    memset(&ed_stats, 0, sizeof ed_stats);
+    memset(&ed_ctx, 0, sizeof ed_ctx);
     used_node_count = 0;
     registered_update_count = 0;
 
@@ -2001,18 +2046,34 @@ ed_init(void *hwnd)
     ed_allocate_colors();
 
     // Default UI font
-    NONCLIENTMETRICS ncmetrics = {};
+    NONCLIENTMETRICS ncmetrics = {0};
     ncmetrics.cbSize = sizeof(ncmetrics);
-    SystemParametersInfo(SPI_GETNONCLIENTMETRICS, sizeof(ncmetrics), &ncmetrics, 0);
-    ui_font = CreateFontIndirect(&ncmetrics.lfStatusFont);
+    SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof(ncmetrics), &ncmetrics, 0);
+    ui_font = CreateFontIndirectA(&ncmetrics.lfStatusFont);
 
+    // Default style
+    ed_style.spacing = 8;
+    ed_style.padding = 8;
+    ed_style.border_size = 1;
+    ed_style.scrollbar_size = 15;
+    ed_style.text_w_spacing = 20;
+    ed_style.text_h_spacing = 10;
+    ed_style.caption_height = 26;
+    ed_style.scroll_sensitivity = 8;
+    ed_style.scroll_unit = 15;
+    ed_style.number_input_deadzone = 3;
+    ed_style.label_width = 0.4f;
+    ed_style.label_height = 20.0f;
+    ed_style.input_height = 20.0f;
+    ed_style.number_input_float_increment = 0.01f;
+    ed_style.number_input_float64_increment = 0.01;
     ed_style.value_formats[ED_STRING]  = "%s";
     ed_style.value_formats[ED_INT]     = "%d";
     ed_style.value_formats[ED_FLOAT]   = "%.3f";
     ed_style.value_formats[ED_INT64]   = "%lld";
     ed_style.value_formats[ED_FLOAT64] = "%.3f";
 
-    // Parent window class
+    // Window procs
     ed_register_class("ED_WINDOW", ed_window_proc);
     ed_register_class("ED_USERWINDOW", ed_user_window_proc);
     ed_register_class("ED_CAPTION", ed_caption_proc);
@@ -2021,6 +2082,7 @@ ed_init(void *hwnd)
     ed_register_class("ED_COLOR_SLICE", ed_color_slice_proc);
     ed_register_class("ED_COLOR_HUE", ed_color_hue_proc);
 
+    // Root node
     ed_node *root = ed_index_node(ED_ID_ROOT);
     used_node_count = ED_ID_ROOT;
     root->id = ED_ID_ROOT;
@@ -2036,7 +2098,7 @@ ed_init(void *hwnd)
 
 // Frees resources used by the library.
 void
-ed_deinit()
+ed_deinit(void)
 {
     for (size_t i = ED_ID_ROOT; i < used_node_count; ++i) {
         ed_free_node_resources(&ed_tree[i]);
@@ -2067,12 +2129,13 @@ ed_deinit()
 //
 //   If NULL, the update function is always called.
 void
-ed_register_update(ed_node *node, void (*update)())
+ed_register_update(ed_node *node, void (*update)(void))
 {
     assert(registered_update_count < ED_UPDATE_FUNCS_COUNT
             && "too many registered update functions.");
 
-    ed_update_funcs[registered_update_count] = {node, update};
+    ed_node_update node_update = {node, update};
+    ed_update_funcs[registered_update_count] = node_update;
     ++registered_update_count;
 
     if (node) {
@@ -2099,7 +2162,7 @@ ed_unregister_update(ed_node *node)
         if (ed_update_funcs[i].node == node) {
             --registered_update_count;
             ed_update_funcs[i] = ed_update_funcs[registered_update_count];
-            ed_update_funcs[registered_update_count] = {};
+            memset(&ed_update_funcs[registered_update_count], 0, sizeof(ed_node_update));
         }
     }
 }
@@ -2165,7 +2228,7 @@ next_frame:
 
 // Set colors to the default system theme.
 void
-ed_apply_system_colors()
+ed_apply_system_colors(void)
 {
     ed_style.colors[ED_COLOR_WINDOW]        = GetSysColor(COLOR_WINDOW);
     ed_style.colors[ED_COLOR_WINDOWTEXT]    = GetSysColor(COLOR_WINDOWTEXT);
@@ -2178,7 +2241,7 @@ ed_apply_system_colors()
 
 // Creates brushes for colors.
 void
-ed_allocate_colors()
+ed_allocate_colors(void)
 {
     for (size_t color = 0; color < ED_COLOR_COUNT; ++color) {
         if (brushes[color]) {
@@ -2232,7 +2295,7 @@ ed_invalidate_data(ed_node *node)
             node->value_type <= ED_VALUE_TYPE_SCALAR_MAX) {
         ed_invalidate_scalar(node);
     } else if (node->value_type == ED_STRING) {
-        SetWindowText(ed_hwnd(node), (char *)node->value_ptr);
+        SetWindowTextA(ed_hwnd(node), (char *)node->value_ptr);
     } else if (node->value_type == ED_DIB) {
         InvalidateRect(ed_hwnd(node), NULL, TRUE);
     } else if (node->value_type == ED_COLOR) {
@@ -2254,7 +2317,7 @@ ed_invalidate_data(ed_node *node)
 //   This argument is the size of the string buffer pointed to by `value`. If
 //   the user input exceeds the given buffer size, the input is truncated.
 void
-ed_data(ed_node *node, void *value, size_t size)
+ed_str_data(ed_node *node, void *value, size_t size)
 {
     assert(node->type != ED_NONE
             && "invalid node, it's possible this node was previously removed.");
@@ -2282,6 +2345,15 @@ ed_data(ed_node *node, void *value, size_t size)
         assert(node->value_size);
         ed_data(node->node_list, (char *)value + node->value_size);
     }
+}
+
+// Updates the value for a node and invalidates the node if the value has
+// changed since the last call to `ed_data`. If the data spans multiple nodes,
+// this function recurses while `next_value_node` is not NULL.
+void
+ed_data(ed_node *node, void *value)
+{
+    ed_str_data(node, value, 0);
 }
 
 // Saves the current active parent and child, and sets the active parent to the
@@ -2312,7 +2384,7 @@ ed_begin_context(ed_node *node)
 
 // Restores active context with context saved with `ed_begin_context`.
 void
-ed_end_context()
+ed_end_context(void)
 {
     assert(ed_saved_ctx.parent
             && "expected ed_begin_context before ed_end_context.");
@@ -2387,17 +2459,41 @@ ed_attach_hwnd(ed_node *node, const char *class_name, const char *name, int flag
     HMENU hmenu = NULL;
     if (flags & WS_CHILD) hmenu = (HMENU)id;
 
-    node->hwnd = CreateWindow(
+    node->hwnd = CreateWindowA(
             class_name, name, flags,
             0, 0, 100, 20, // Set during ed_layout
             ed_hwnd(node->parent),
             hmenu, NULL, NULL);
 
-    SetWindowLongPtr(ed_hwnd(node), GWLP_USERDATA, (LONG_PTR)node);
+    SetWindowLongPtrA(ed_hwnd(node), GWLP_USERDATA, (LONG_PTR)node);
 
     if ((node->flags & ED_TEXTNODE) || node->type == ED_COMBOBOX) {
-        SendMessage(ed_hwnd(node), WM_SETFONT, (WPARAM)ui_font, FALSE);
+        SendMessageA(ed_hwnd(node), WM_SETFONT, (WPARAM)ui_font, FALSE);
     }
+}
+
+// Pushes a rect to be used by the next control initialization function.
+void
+ed_push_rect(float x, float y, float w, float h)
+{
+    assert(rect_stack_count < ARRAYSIZE(rect_stack));
+    ed_rect rect = {x, y, w, h};
+    rect_stack[rect_stack_count] = rect;
+    ++rect_stack_count;
+}
+
+// Removes and returns a rect from the rect stack. If the stack is empty a
+// default is created with the values given.
+ed_rect
+ed_pop_rect(float x, float y, float w, float h)
+{
+    if (rect_stack_count == 0) {
+        ed_rect default_rect = {x, y, w, h};
+        return default_rect;
+    }
+
+    --rect_stack_count;
+    return rect_stack[rect_stack_count];
 }
 
 // Creates a parent block.
@@ -2405,9 +2501,9 @@ ed_attach_hwnd(ed_node *node, const char *class_name, const char *name, int flag
 // All functions starting with `ed_begin` must eventually be followed by
 // `ed_end`.
 ed_node *
-ed_begin(ed_rect rect, ed_node_layout layout)
+ed_begin(ed_node_layout layout, float x, float y, float w, float h)
 {
-    ed_node *node = ed_push(ED_BLOCK, rect);
+    ed_node *node = ed_push(ED_BLOCK, x, y, w, h);
     node->layout = layout;
     ed_attach_hwnd(node, "ED_WINDOW", NULL, WS_CHILD | WS_VISIBLE);
     return node;
@@ -2415,9 +2511,9 @@ ed_begin(ed_rect rect, ed_node_layout layout)
 
 // Creates a block with padding and an outline border.
 ed_node *
-ed_begin_border(ed_rect rect, ed_node_layout layout)
+ed_begin_border(ed_node_layout layout, float x, float y, float w, float h)
 {
-    ed_node *node = ed_push(ED_BLOCK, rect);
+    ed_node *node = ed_push(ED_BLOCK, x, y, w, h);
     node->layout = layout;
     node->padding = ed_style.padding;
     node->spacing = ed_style.spacing;
@@ -2432,16 +2528,16 @@ ed_begin_border(ed_rect rect, ed_node_layout layout)
 ed_node *
 ed_begin_scroll(ed_node_layout layout)
 {
-    ed_node *scrollblock = ed_push(ED_SCROLLBLOCK, {0, 0, 1.0f, 1.0f});
+    ed_node *scrollblock = ed_push(ED_SCROLLBLOCK, 0, 0, 1.0f, 1.0f);
     scrollblock->layout = ED_HORZ;
 
-    ed_node *client = ed_attach(ED_BLOCK, {0, 0, 1.0f, 1.0f});
+    ed_node *client = ed_attach(ED_BLOCK, 0, 0, 1.0f, 1.0f);
     client->layout = layout;
     client->padding = ed_style.padding;
     client->flags = ED_POPPARENT;
 
     int sb_width = GetSystemMetrics(SM_CXVSCROLL);
-    ed_node *scroll_bar = ed_attach(ED_SCROLLBAR, {1.0f, 0, (float)sb_width, 1.0f});
+    ed_node *scroll_bar = ed_attach(ED_SCROLLBAR, 1.0f, 0, (float)sb_width, 1.0f);
     scroll_bar->scroll_client = client->id;
     client->scroll_bar = scroll_bar->id;
 
@@ -2454,14 +2550,15 @@ ed_begin_scroll(ed_node_layout layout)
 
 // Creates a new child window with a title bar and vertical scroll bar.
 ed_node *
-ed_begin_window(const char *name, ed_rect rect, ed_node_layout layout)
+ed_begin_window(const char *name, ed_node_layout layout, float x, float y, float w, float h)
 {
-    ed_node *node = ed_push(ED_WINDOW, rect);
+    ed_node *node = ed_push(ED_WINDOW, x, y, w, h);
     node->layout = ED_VERT;
     node->flags = ED_BORDER;
     node->padding = 1;
 
-    ed_node *cap = ed_attach(ED_CAPTION, {0, 0, 1.0f, (float)ed_style.caption_height});
+    float height = ed_style.caption_height;
+    ed_node *cap = ed_attach(ED_CAPTION, 0, 0, 1.0f, height);
     ed_attach_hwnd(node, "ED_WINDOW", name, WS_CHILD | WS_VISIBLE);
     ed_attach_hwnd(cap, "ED_CAPTION", name, WS_CHILD | WS_VISIBLE);
 
@@ -2474,13 +2571,14 @@ ed_begin_window(const char *name, ed_rect rect, ed_node_layout layout)
 //
 // Use `ed_collapse` and `ed_expand` to programatically control the group.
 ed_node *
-ed_begin_group(const char *name, ed_rect rect, ed_node_layout layout)
+ed_begin_group(const char *name, ed_node_layout layout, float x, float y, float w, float h)
 {
-    ed_node *node = ed_push(ED_GROUP, rect);
+    ed_node *node = ed_push(ED_GROUP, x, y, w, h);
     node->layout = layout;
     node->flags = ED_EXPAND;
 
-    ed_node *cap = ed_attach(ED_CAPTION, {0, 0, 1.0f, (float)ed_style.caption_height});
+    float height = ed_style.caption_height;
+    ed_node *cap = ed_attach(ED_CAPTION, 0, 0, 1.0f, height);
     cap->spacing = ed_style.spacing;
     cap->flags = ED_TABSTOP;
 
@@ -2496,9 +2594,9 @@ ed_begin_group(const char *name, ed_rect rect, ed_node_layout layout)
 // onclick:
 //   Event called when the button is clicked, or NULL.
 ed_node *
-ed_begin_button(void (*onclick)(ed_node *node), ed_rect rect)
+ed_begin_button(float x, float y, float w, float h, void (*onclick)(ed_node *node))
 {
-    ed_node *node = ed_push(ED_BUTTON, rect);
+    ed_node *node = ed_push(ED_BUTTON, x, y, w, h);
     node->flags = ED_TABSTOP;
     node->onclick = onclick;
     node->spacing = ed_style.spacing;
@@ -2522,23 +2620,23 @@ ed_node *
 ed_begin_hwnd(void *hwnd, ed_node_layout layout)
 {
     assert(hwnd);
-    ed_node *node = ed_push(ED_USERWINDOW, {});
+    ed_node *node = ed_push(ED_USERWINDOW, 0, 0, 0, 0);
     node->layout = layout;
     node->hwnd = (HWND)hwnd;
 
-    LONG style = GetWindowLong(ed_hwnd(node), GWL_STYLE);
+    LONG style = GetWindowLongA(ed_hwnd(node), GWL_STYLE);
     if (style & WS_CHILD) {
         assert(node->parent);
         SetParent(ed_hwnd(node), ed_hwnd(node->parent));
     }
 
-    SetWindowLongPtr(ed_hwnd(node), GWLP_USERDATA, (LONG_PTR)node);
+    SetWindowLongPtrA(ed_hwnd(node), GWLP_USERDATA, (LONG_PTR)node);
     return node;
 }
 
 // Ends the parent context.
 void
-ed_end()
+ed_end(void)
 {
     ed_pop();
     if (ed_ctx.parent->id == ED_ID_ROOT) {
@@ -2550,9 +2648,10 @@ ed_end()
 // to modify the label. Set the node `value_type` and `value_fmt` to use a
 // number format.
 ed_node *
-ed_label(const char *label, ed_rect rect)
+ed_label(const char *label)
 {
-    ed_node *node = ed_attach(ED_LABEL, rect);
+    ed_rect rect = ed_pop_rect(0, 0, 0, 0);
+    ed_node *node = ed_attach(ED_LABEL, rect.x, rect.y, rect.w, rect.h);
     node->spacing = ed_style.spacing;
     node->flags = ED_TEXTNODE;
 
@@ -2567,9 +2666,10 @@ ed_label(const char *label, ed_rect rect)
 // onclick:
 //   Event called when the button is clicked, or NULL.
 ed_node *
-ed_button(const char *label, void (*onclick)(ed_node *node), ed_rect rect)
+ed_button(const char *label, void (*onclick)(ed_node *node))
 {
-    ed_node *node = ed_attach(ED_BUTTON, rect);
+    ed_rect rect = ed_pop_rect(0, 0, 0, 0);
+    ed_node *node = ed_attach(ED_BUTTON, rect.x, rect.y, rect.w, rect.h);
     node->flags = ED_BORDER | ED_TABSTOP | ED_TEXTNODE;
     node->onclick = onclick;
     node->spacing = ed_style.spacing;
@@ -2590,9 +2690,9 @@ ed_space(float size)
     ed_node *node;
 
     if (ed_ctx.parent->layout == ED_VERT) {
-        node = ed_attach(ED_SPACE, {0, 0, 1.0f, size});
+        node = ed_attach(ED_SPACE, 0, 0, 1.0f, size);
     } else {
-        node = ed_attach(ED_SPACE, {0, 0, size, 1.0f});
+        node = ed_attach(ED_SPACE, 0, 0, size, 1.0f);
     }
 
     ed_attach_hwnd(node, "ED_WINDOW", "", WS_CHILD | WS_VISIBLE);
@@ -2601,53 +2701,22 @@ ed_space(float size)
 
 // Creates a vertical or horizontal separator.
 ed_node *
-ed_separator()
+ed_separator(void)
 {
     assert(ed_ctx.parent && ed_ctx.parent->layout != ED_ABS &&
             "separator node can only be used with a horizontal or vertical layout.");
     ed_node *node;
 
     if (ed_ctx.parent->layout == ED_VERT) {
-        node = ed_attach(ED_SEPARATOR, {0, 0, 1.0f, 1.1f});
+        node = ed_attach(ED_SEPARATOR, 0, 0, 1.0f, 1.1f);
         node->spacing = ed_style.spacing;
         ed_attach_hwnd(node, "STATIC", "", WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ);
     } else {
-        node = ed_attach(ED_SEPARATOR, {0, 0, 1.1f, 1.0f});
+        node = ed_attach(ED_SEPARATOR, 0, 0, 1.1f, 1.0f);
         node->spacing = ed_style.spacing;
         ed_attach_hwnd(node, "STATIC", "", WS_CHILD | WS_VISIBLE | SS_ETCHEDVERT);
     }
 
-    return node;
-}
-
-// Creates a single input node. The value of the input node can be updated
-// using `ed_data`.
-//
-//     float x = 1.0f;
-//     ED_Node *node = ed_input(ED_FLOAT);
-//     ed_data(node, &x);
-ed_node *
-ed_input(ed_value_type value_type, ed_rect rect)
-{
-    ed_node *node = ed_attach(ED_INPUT, rect);
-    node->spacing = ed_style.spacing;
-    node->flags = ED_TABSTOP | ED_TEXTNODE;
-    node->value_type = value_type;
-    memset(&node->value, 0, sizeof node->value);
-
-    ed_attach_hwnd(node, "EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL);
-    ed_measure_text_bounds(node);
-    SetWindowSubclass(ed_hwnd(node), ed_edit_proc, 0, 0);
-    SetWindowSubclass(ed_hwnd(node), ed_tabstop_proc, 1, 0);
-    SetWindowSubclass(ed_hwnd(node), ed_text_proc, 2, 0);
-
-    if (node->value_type >= ED_VALUE_TYPE_NUMBER_MIN
-            && node->value_type <= ED_VALUE_TYPE_NUMBER_MAX) {
-        SetWindowSubclass(ed_hwnd(node), ed_number_proc, 3, 0);
-    }
-
-    // node->value_ptr starts by pointing to the internal value storage.
-    ed_data(node, node->value);
     return node;
 }
 
@@ -2658,29 +2727,37 @@ ed_input(ed_value_type value_type, ed_rect rect)
 //
 // Returns a pointer to the input node.
 ed_node *
-ed_input(const char *label, ed_value_type value_type, ed_rect rect)
+ed_input(const char *label, ed_value_type value_type)
 {
-    ed_begin(rect, ED_HORZ);
-
-    if (label) {
-        ed_label(label, {0, 0, ed_style.label_width, ed_style.label_height});
+    if (!label) {
+        return ed_input_basic(value_type);
     }
 
-    ed_node *node = ed_input(value_type, {0, 0, 1.0f, ed_style.input_height});
+    ed_rect rect = ed_pop_rect(0, 0, 1.0f, 0);
+    ed_begin(ED_HORZ, rect.x, rect.y, rect.w, rect.h);
+
+    ed_push_rect(0, 0, ed_style.label_width, ed_style.label_height);
+    ed_label(label);
+
+    ed_push_rect(0, 0, 1.0f, ed_style.input_height);
+    ed_node *node = ed_input_basic(value_type);
     ed_end();
 
     return node;
 }
 
-// Creates a string input node.
+// Creates an int input node.
 //
-//     char str[256];
-//     ED_Node *node = ed_string("String");
-//     ed_data(node, str, sizeof(str));
+// value_min, value_max:
+//   If `value_min == value_max` the input range is not constrained.
 ed_node *
-ed_string(const char *label, ed_rect rect)
+ed_int(const char *label, int value_min, int value_max)
 {
-    return ed_input(label, ED_STRING, rect);
+    ed_node *node = ed_input(label, ED_INT);
+    ed_write_value(int, &node->value_min, &value_min);
+    ed_write_value(int, &node->value_max, &value_max);
+
+    return node;
 }
 
 // Creates an int input node.
@@ -2697,14 +2774,13 @@ ed_string(const char *label, ed_rect rect)
 //   hexadecimal. If 0, the base is determined based on whether the input has a
 //   "0" prefix (octal), "0x" prefix (hexadecimal), or no prefix (decimal).
 ed_node *
-ed_int(const char *label, int value_min, int value_max,
-        const char *fmt, int base, ed_rect rect)
+ed_int_fmt(const char *label, int value_min, int value_max, const char *fmt, int base)
 {
-    ed_node *node = ed_input(label, ED_INT, rect);
-    node->value_fmt = fmt;
+    ed_node *node = ed_input(label, ED_INT);
     ed_write_value(int, &node->value_min, &value_min);
     ed_write_value(int, &node->value_max, &value_max);
     ed_write_value(int, &node->value[8], &base);
+    node->value_fmt = fmt;
 
     return node;
 }
@@ -2713,18 +2789,26 @@ ed_int(const char *label, int value_min, int value_max,
 //
 // value_min, value_max:
 //   If `value_min == value_max` the input range is not constrained.
-//
-// fmt:
-//   printf format used when formatting the number. Can be set to NULL to use
-//   the default value in `ed_style.value_formats`.
 ed_node *
-ed_float(const char *label, float value_min, float value_max,
-        const char *fmt, ed_rect rect)
+ed_float(const char *label, float value_min, float value_max)
 {
-    ed_node *node = ed_input(label, ED_FLOAT, rect);
-    node->value_fmt = fmt;
+    ed_node *node = ed_input(label, ED_FLOAT);
     ed_write_value(float, &node->value_min, &value_min);
     ed_write_value(float, &node->value_max, &value_max);
+
+    return node;
+}
+
+// Creates a 64 bit int input node.
+//
+// value_min, value_max:
+//   If `value_min == value_max` the input range is not constrained.
+ed_node *
+ed_int64(const char *label, long long value_min, long long value_max)
+{
+    ed_node *node = ed_input(label, ED_INT64);
+    ed_write_value(long long, &node->value_min, &value_min);
+    ed_write_value(long long, &node->value_max, &value_max);
 
     return node;
 }
@@ -2743,14 +2827,14 @@ ed_float(const char *label, float value_min, float value_max,
 //   hexadecimal. If 0, the base is determined based on whether the input has a
 //   "0" prefix (octal), "0x" prefix (hexadecimal), or no prefix (decimal).
 ed_node *
-ed_int64(const char *label, long long value_min, long long value_max,
-        const char *fmt, int base, ed_rect rect)
+ed_int64_fmt(const char *label, long long value_min, long long value_max,
+        const char *fmt, int base)
 {
-    ed_node *node = ed_input(label, ED_INT64, rect);
-    node->value_fmt = fmt;
+    ed_node *node = ed_input(label, ED_INT64);
     ed_write_value(long long, &node->value_min, &value_min);
     ed_write_value(long long, &node->value_max, &value_max);
     ed_write_value(int, &node->value[8], &base);
+    node->value_fmt = fmt;
 
     return node;
 }
@@ -2759,16 +2843,10 @@ ed_int64(const char *label, long long value_min, long long value_max,
 //
 // value_min, value_max:
 //   If `value_min == value_max` the input range is not constrained.
-//
-// fmt:
-//   printf format used when formatting the number. Can be set to NULL to use
-//   the default value in `ed_style.value_formats`.
 ed_node *
-ed_float64(const char *label, double value_min, double value_max,
-        const char *fmt, ed_rect rect)
+ed_float64(const char *label, double value_min, double value_max)
 {
-    ed_node *node = ed_input(label, ED_FLOAT64, rect);
-    node->value_fmt = fmt;
+    ed_node *node = ed_input(label, ED_FLOAT64);
     ed_write_value(double, &node->value_min, &value_min);
     ed_write_value(double, &node->value_max, &value_max);
 
@@ -2778,12 +2856,15 @@ ed_float64(const char *label, double value_min, double value_max,
 // Creates a dropdown combobox. The result of `ed_data` corresponds to the
 // index of the selected item in the dropdown list.
 ed_node *
-ed_enum(const char *label, const char **items, size_t items_count, ed_rect rect)
+ed_enum(const char *label, const char **items, size_t items_count)
 {
-    ed_begin(rect, ED_HORZ);
-    ed_label(label, {0, 0, ed_style.label_width, ed_style.label_height});
+    ed_rect rect = ed_pop_rect(0, 0, 1.0f, 0);
+    ed_begin(ED_HORZ, rect.x, rect.y, rect.w, rect.h);
 
-    ed_node *node = ed_attach(ED_COMBOBOX, {0, 0, 1.0f - ed_style.label_width, 0});
+    ed_push_rect(0, 0, ed_style.label_width, ed_style.label_height);
+    ed_label(label);
+
+    ed_node *node = ed_attach(ED_COMBOBOX, 0, 0, 1.0f - ed_style.label_width, 0);
     node->flags = ED_TABSTOP;
     node->value_type = ED_ENUM;
     node->bounds.h = (short)(ed_style.label_height * items_count);
@@ -2796,7 +2877,7 @@ ed_enum(const char *label, const char **items, size_t items_count, ed_rect rect)
     SetWindowSubclass(ed_hwnd(node), ed_tabstop_proc, 1, 0);
 
     for (size_t i = 0; i < items_count; ++i) {
-        SendMessage(ed_hwnd(node), CB_ADDSTRING, 0, (LPARAM)items[i]);
+        SendMessageA(ed_hwnd(node), CB_ADDSTRING, 0, (LPARAM)items[i]);
     }
 
     return node;
@@ -2804,12 +2885,15 @@ ed_enum(const char *label, const char **items, size_t items_count, ed_rect rect)
 
 // Creates a dropdown combobox where each element toggles a bit in a int flag.
 ed_node *
-ed_flags(const char *label, const char **items, size_t items_count, ed_rect rect)
+ed_flags(const char *label, const char **items, size_t items_count)
 {
-    ed_begin(rect, ED_HORZ);
-    ed_label(label, {0, 0, ed_style.label_width, ed_style.label_height});
+    ed_rect rect = ed_pop_rect(0, 0, 1.0f, 0);
+    ed_begin(ED_HORZ, rect.x, rect.y, rect.w, rect.h);
 
-    ed_node *node = ed_attach(ED_COMBOBOX, {0, 0, 1.0f - ed_style.label_width, 0});
+    ed_push_rect(0, 0, ed_style.label_width, ed_style.label_height);
+    ed_label(label);
+
+    ed_node *node = ed_attach(ED_COMBOBOX, 0, 0, 1.0f - ed_style.label_width, 0);
     node->flags = ED_TABSTOP;
     node->value_type = ED_FLAGS;
     node->bounds.h = (short)(ed_style.label_height * items_count);
@@ -2823,7 +2907,7 @@ ed_flags(const char *label, const char **items, size_t items_count, ed_rect rect
     SetWindowSubclass(ed_hwnd(node), ed_tabstop_proc, 1, 0);
 
     for (size_t i = 0; i < items_count; ++i) {
-        SendMessage(ed_hwnd(node), CB_ADDSTRING, 0, (LPARAM)items[i]);
+        SendMessageA(ed_hwnd(node), CB_ADDSTRING, 0, (LPARAM)items[i]);
     }
 
     return node;
@@ -2832,12 +2916,15 @@ ed_flags(const char *label, const char **items, size_t items_count, ed_rect rect
 // Creates a checkbox node. Initially the checkbox will be in an indeterminate
 // state until `ed_data` is called to initialize the checkbox with a value.
 ed_node *
-ed_bool(const char *label, ed_rect rect)
+ed_bool(const char *label)
 {
-    ed_begin(rect, ED_HORZ);
-    ed_label(label, {0, 0, ed_style.label_width, ed_style.label_height});
+    ed_rect rect = ed_pop_rect(0, 0, 1.0f, 0);
+    ed_begin(ED_HORZ, rect.x, rect.y, rect.w, rect.h);
 
-    ed_node *node = ed_attach(ED_CHECKBOX, {0, 0, 1.0f - ed_style.label_width, 0});
+    ed_push_rect(0, 0, ed_style.label_width, ed_style.label_height);
+    ed_label(label);
+
+    ed_node *node = ed_attach(ED_CHECKBOX, 0, 0, 1.0f - ed_style.label_width, 0);
     node->flags = ED_TABSTOP;
     node->value_type = ED_BOOL;
     memset(&node->value, BST_INDETERMINATE, 1);
@@ -2845,22 +2932,24 @@ ed_bool(const char *label, ed_rect rect)
 
     ed_attach_hwnd(node, "BUTTON", NULL, WS_CHILD | WS_VISIBLE | BS_3STATE);
     SetWindowSubclass(ed_hwnd(node), ed_tabstop_proc, 1, 0);
-    SendMessage(ed_hwnd(node), BM_SETCHECK, BST_INDETERMINATE, 0);
+    SendMessageA(ed_hwnd(node), BM_SETCHECK, BST_INDETERMINATE, 0);
 
     return node;
 }
 
 // Creates a multiline textbox.
 ed_node *
-ed_text(const char *label, ed_rect rect)
+ed_text(const char *label)
 {
-    ed_node *vert = ed_begin(rect, ED_HORZ);
+    ed_rect rect = ed_pop_rect(0, 0, 1.0f, 150);
+    ed_node *vert = ed_begin(ED_HORZ, rect.x, rect.y, rect.w, rect.h);
     vert->spacing = ed_style.spacing;
     if (label) {
-        ed_label(label, {0, 0, ed_style.label_width, ed_style.label_height});
+        ed_push_rect(0, 0, ed_style.label_width, ed_style.label_height);
+        ed_label(label);
     }
 
-    ed_node *node = ed_attach(ED_INPUT, {0, 0, 1.0f, 1.0f});
+    ed_node *node = ed_attach(ED_INPUT, 0, 0, 1.0f, 1.0f);
     node->flags = ED_TABSTOP | ED_TEXTNODE;
     node->value_type = ED_STRING;
     node->spacing = ed_style.spacing;
@@ -2888,7 +2977,7 @@ ed_text(const char *label, ed_rect rect)
 //
 // If n>4 the the labels correspond to the element index in the array.
 //
-//     int nums = {1, 2, 3, 4, 5};
+//     int nums[] = {1, 2, 3, 4, 5};
 //     ed_data(ed_vector("B", ED_INT, 5), nums);
 //
 // B      0 [1]
@@ -2901,30 +2990,37 @@ ed_text(const char *label, ed_rect rect)
 // of subsequent nodes (`next_value_node`). Only the node returned should be
 // used as an argument to `ed_data`.
 ed_node *
-ed_vector(const char *label, ed_value_type value_type, size_t n, ed_rect rect)
+ed_vector(const char *label, ed_value_type value_type, size_t n)
 {
-    static const char* item_labels[4] = {"X", "Y", "Z", "W"};
+    static const char *item_labels[4] = {"X", "Y", "Z", "W"};
     const int font_width = 10;
     float item_label_width = (float)((int)(log10f((float)n) + 1.0f) * font_width);
     ed_node *first = NULL;
     ed_node *last = NULL;
 
-    ed_begin(rect, ED_HORZ);
-    if (label) ed_label(label, {0, 0, ed_style.label_width, ed_style.label_height});
-    ed_begin({0, 0, 1.0f, 0}, ED_VERT);
+    ed_rect rect = ed_pop_rect(0, 0, 1.0f, 0);
+    ed_begin(ED_HORZ, rect.x, rect.y, rect.w, rect.h);
+    if (label) {
+        ed_push_rect(0, 0, ed_style.label_width, ed_style.label_height);
+        ed_label(label);
+    }
+    ed_begin(ED_VERT, 0, 0, 1.0f, 0);
 
     for (size_t i = 0; i < n; ++i) {
-        ed_begin({0, 0, 1.0f, 0}, ED_HORZ);
+        ed_begin(ED_HORZ, 0, 0, 1.0f, 0);
 
         if (n < ARRAYSIZE(item_labels)) {
-            ed_label(item_labels[i], {0, 0, item_label_width, ed_style.label_height});
+            ed_push_rect(0, 0, item_label_width, ed_style.label_height);
+            ed_label(item_labels[i]);
         } else {
             char item_label[16];
             snprintf(item_label, sizeof item_label, "%zu", i);
-            ed_label(item_label, {0, 0, item_label_width, ed_style.label_height});
+            ed_push_rect(0, 0, item_label_width, ed_style.label_height);
+            ed_label(item_label);
         }
 
-        ed_node *node = ed_input(value_type, {0, 0, 1.0f, ed_style.input_height});
+        ed_push_rect(0, 0, 1.0f, ed_style.input_height);
+        ed_node *node = ed_input_basic(value_type);
         if (i == 0) {
             first = node;
             last = node;
@@ -2943,18 +3039,62 @@ ed_vector(const char *label, ed_value_type value_type, size_t n, ed_rect rect)
 // Creates a grid of m rows and n columns of input fields. `ed_data` populates
 // the matrix in column-major order.
 //
-// transpose:
-//   Uses the transpose of the matrix producing a nxm matrix. This can be used
-//   to switch to a row-major layout instead of the default column-major order
-//   when populating the matrix with `ed_data`.
-//
 //     float mat[] = {1, 2, 3, 4}
 //
 //     ed_data(ed_matrix("A", ED_FLOAT, 2, 2), mat);
 //     // [ 1, 3,
 //     //   2, 4 ]
 //
-//     ed_data(ed_matrix("B", ED_FLOAT, 2, 2, /* transpose: */ true), mat);
+// value_size:
+//   Size in bytes of each element. If 0, a default size is chosen depending
+//   on the `value_type` argument.
+//
+// Returns a pointer to the first input node, which is a list of subsequent
+// nodes (`next_value_node`). Only the node returned should be used as an
+// argument to `ed_data`.
+ed_node *
+ed_matrix(const char *label, ed_value_type value_type, size_t m, size_t n)
+{
+    ed_node *first = NULL;
+    ed_node *last = NULL;
+
+    ed_rect rect = ed_pop_rect(0, 0, 1.0f, 0);
+    ed_begin(ED_HORZ, rect.x, rect.y, rect.w, rect.h);
+    if (label) {
+        ed_push_rect(0, 0, ed_style.label_width, ed_style.label_height);
+        ed_label(label);
+    }
+
+    float input_w = 1.0f / (float)n;
+    ed_begin(ED_HORZ, rect.x, rect.y, rect.w, rect.h);
+    for (size_t i = 0; i < n; ++i) {
+        ed_begin(ED_VERT, 0, 0, input_w, 0)->spacing = ed_style.spacing;
+        for (size_t j = 0; j < m; ++j) {
+            ed_push_rect(0, 0, 1.0f, ed_style.input_height);
+            ed_node *node = ed_input_basic(value_type);
+
+            if (first) {
+                last->node_list = node;
+                last = node;
+            } else {
+                first = node;
+                last = node;
+            }
+        }
+        ed_end();
+    }
+
+    ed_end();
+    ed_end();
+    return first;
+}
+
+// Creates a grid of m rows and n columns of input fields. `ed_data` populates
+// the matrix in row-major order.
+//
+//     float mat[] = {1, 2, 3, 4}
+//
+//     ed_data(ed_matrix_row("B", ED_FLOAT, 2, 2), mat);
 //     // [ 1, 2,
 //     //   3, 4 ]
 //
@@ -2966,51 +3106,35 @@ ed_vector(const char *label, ed_value_type value_type, size_t n, ed_rect rect)
 // nodes (`next_value_node`). Only the node returned should be used as an
 // argument to `ed_data`.
 ed_node *
-ed_matrix(const char *label, ed_value_type value_type, size_t m, size_t n,
-        bool transpose, ed_rect rect)
+ed_matrix_row(const char *label, ed_value_type value_type, size_t m, size_t n)
 {
     ed_node *first = NULL;
     ed_node *last = NULL;
 
-    ed_begin(rect, ED_HORZ);
-    if (label) ed_label(label, {0, 0, ed_style.label_width, ed_style.label_height});
+    ed_rect rect = ed_pop_rect(0, 0, 1.0f, 0);
+    ed_begin(ED_HORZ, rect.x, rect.y, rect.w, rect.h);
+    if (label) {
+        ed_push_rect(0, 0, ed_style.label_width, ed_style.label_height);
+        ed_label(label);
+    }
 
-    if (transpose) {
-        float input_w = 1.0f / (float)m;
-        ed_begin(rect, ED_VERT);
-        for (size_t i = 0; i < n; ++i) {
-            ed_begin({0, 0, 1.0f, 0}, ED_HORZ);
-            for (size_t j = 0; j < m; ++j) {
-                ed_node *node = ed_input(value_type, {0, 0, input_w, ed_style.input_height});
+    float input_w = 1.0f / (float)m;
+    ed_begin(ED_VERT, rect.x, rect.y, rect.w, rect.h);
+    for (size_t i = 0; i < n; ++i) {
+        ed_begin(ED_HORZ, 0, 0, 1.0f, 0);
+        for (size_t j = 0; j < m; ++j) {
+            ed_push_rect(0, 0, input_w, ed_style.input_height);
+            ed_node *node = ed_input_basic(value_type);
 
-                if (first) {
-                    last->node_list = node;
-                    last = node;
-                } else {
-                    first = node;
-                    last = node;
-                }
+            if (first) {
+                last->node_list = node;
+                last = node;
+            } else {
+                first = node;
+                last = node;
             }
-            ed_end();
         }
-    } else {
-        float input_w = 1.0f / (float)n;
-        ed_begin(rect, ED_HORZ);
-        for (size_t i = 0; i < n; ++i) {
-            ed_begin({0, 0, input_w, 0}, ED_VERT)->spacing = ed_style.spacing;
-            for (size_t j = 0; j < m; ++j) {
-                ed_node *node = ed_input(value_type, {0, 0, 1.0f, ed_style.input_height});
-
-                if (first) {
-                    last->node_list = node;
-                    last = node;
-                } else {
-                    first = node;
-                    last = node;
-                }
-            }
-            ed_end();
-        }
+        ed_end();
     }
 
     ed_end();
@@ -3018,16 +3142,22 @@ ed_matrix(const char *label, ed_value_type value_type, size_t m, size_t n,
     return first;
 }
 
+// Creates a color input node. Clicking on the color preview opens up the color
+// picker. The color value is assumed to be in the sRGB color space (no gamma
+// correction is done before displaying the color in the preview or color
+// picker).
 ed_node *
-ed_color(const char *label, ed_rect rect)
+ed_color(const char *label)
 {
-    ed_begin(rect, ED_HORZ);
+    ed_rect rect = ed_pop_rect(0, 0, 1.0f, 0);
+    ed_begin(ED_HORZ, rect.x, rect.y, rect.w, rect.h);
 
     if (label) {
-        ed_label(label, {0, 0, ed_style.label_width, ed_style.label_height});
+        ed_push_rect(0, 0, ed_style.label_width, ed_style.label_height);
+        ed_label(label);
     }
 
-    ed_node *node = ed_attach(ED_BUTTON, {0, 0, 1.0f, ed_style.input_height});
+    ed_node *node = ed_attach(ED_BUTTON, 0, 0, 1.0f, ed_style.input_height);
     node->spacing = ed_style.spacing;
     node->flags = ED_TABSTOP;
     node->value_type = ED_COLOR;
@@ -3047,24 +3177,21 @@ ed_color(const char *label, ed_rect rect)
 // filename:
 //   Bitmap (.bmp) or icon (.ico) file. The image type is determined from the
 //   file extension (defaults to bitmap).
-//
-// rect:
-//   If `w` or `h` is zero they will be set to match the loaded image
-//   dimensions. Otherwise the image is scaled to fit the rectangle.
 ed_node *
-ed_image(const char *filename, ed_rect rect)
+ed_image(const char *filename)
 {
-    ed_node *node = ed_attach(ED_IMAGE, rect);
+    ed_rect rect = ed_pop_rect(0, 0, 0, 0);
+    ed_node *node = ed_attach(ED_IMAGE, rect.x, rect.y, rect.w, rect.h);
     node->spacing = ed_style.spacing;
     node->flags = ED_OWNDATA;
     ed_load_image(node, filename);
 
     if (node->value_type == ED_ICON) {
         ed_attach_hwnd(node, "STATIC", NULL, WS_CHILD | WS_VISIBLE | SS_ICON);
-        SendMessage(ed_hwnd(node), STM_SETIMAGE, IMAGE_ICON, (LPARAM)node->value_ptr);
+        SendMessageA(ed_hwnd(node), STM_SETIMAGE, IMAGE_ICON, (LPARAM)node->value_ptr);
     } else {
         ed_attach_hwnd(node, "STATIC", NULL, WS_CHILD | WS_VISIBLE | SS_BITMAP);
-        SendMessage(ed_hwnd(node), STM_SETIMAGE, IMAGE_BITMAP, (LPARAM)node->value_ptr);
+        SendMessageA(ed_hwnd(node), STM_SETIMAGE, IMAGE_BITMAP, (LPARAM)node->value_ptr);
     }
 
     return node;
@@ -3090,17 +3217,15 @@ ed_image(const char *filename, ed_rect rect)
 //
 // fmt:
 //   Format of the source buffer.
-//
-// rect:
-//   If `w` or `h` is zero they will be set to match the loaded image
-//   dimensions. Otherwise the image is scaled to fit the rectangle.
 ed_node *
-ed_image(const unsigned char *image, int w, int h, ed_pixel_format fmt, ed_rect rect)
+ed_image_buffer(const unsigned char *image, int w, int h, ed_pixel_format fmt)
 {
+    ed_rect rect = ed_pop_rect(0, 0, 0, 0);
+
     if (rect.w == 0) rect.w = (float)ed_abs(w);
     if (rect.h == 0) rect.h = (float)ed_abs(h);
 
-    ed_node *node = ed_attach(ED_IMAGE, rect);
+    ed_node *node = ed_attach(ED_IMAGE, rect.x, rect.y, rect.w, rect.h);
     node->spacing = ed_style.spacing;
     node->flags = ED_OWNDATA;
     node->value_type = ED_DIB;
@@ -3118,14 +3243,11 @@ ed_image(const unsigned char *image, int w, int h, ed_pixel_format fmt, ed_rect 
 // filename:
 //   Bitmap (.bmp) or icon (.ico) file. The image type is determined from the
 //   file extension (defaults to bitmap).
-//
-// rect:
-//   If `w` or `h` is zero they will be set to match the loaded image
-//   dimensions. Otherwise the image is scaled to fit the rectangle.
-ed_node *ed_image_button(const char *filename,
-        void (*onclick)(ed_node *node), ed_rect rect)
+ed_node *
+ed_image_button(const char *filename, void (*onclick)(ed_node *node))
 {
-    ed_node *node = ed_attach(ED_BUTTON, rect);
+    ed_rect rect = ed_pop_rect(0, 0, 0, 0);
+    ed_node *node = ed_attach(ED_BUTTON, rect.x, rect.y, rect.w, rect.h);
     node->onclick = onclick;
     node->spacing = ed_style.spacing;
     node->flags = ED_OWNDATA | ED_TABSTOP;
@@ -3134,48 +3256,14 @@ ed_node *ed_image_button(const char *filename,
     if (node->value_type == ED_ICON) {
         ed_attach_hwnd(node, "BUTTON", NULL,
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_ICON);
-        SendMessage(ed_hwnd(node), BM_SETIMAGE, IMAGE_ICON, (LPARAM)node->value_ptr);
+        SendMessageA(ed_hwnd(node), BM_SETIMAGE, IMAGE_ICON, (LPARAM)node->value_ptr);
     } else {
         ed_attach_hwnd(node, "BUTTON", NULL,
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_BITMAP);
-        SendMessage(ed_hwnd(node), BM_SETIMAGE, IMAGE_BITMAP, (LPARAM)node->value_ptr);
+        SendMessageA(ed_hwnd(node), BM_SETIMAGE, IMAGE_BITMAP, (LPARAM)node->value_ptr);
     }
 
     SetWindowSubclass(ed_hwnd(node), ed_tabstop_proc, 1, 0);
-    return node;
-}
-
-// Creates a dynamic image button from a pixel buffer. The image can be updated
-// by passing the new buffer to `ed_data`. The modified buffer must be the same
-// dimensions and format of the allocated buffer.
-//
-// `node->value_ptr` points to the created HBITMAP.
-//
-// image:
-//   A buffer with format `fmt` or NULL. The size of the buffer must be
-//   w * h * 3 for RGB buffers and w * h * 4 for buffers with an alpha
-//   component.
-//
-//   If NULL the image buffer is allocated but nothing will be drawn.
-//
-// w, h:
-//   Dimensions of the source image. If negative the image will be mirrored
-//   (0, 0) is on the bottom-left. For a top-down image, use a negative value
-//   for the height.
-//
-// fmt:
-//   Format of the source buffer.
-//
-// rect:
-//   If `w` or `h` is zero they will be set to match the loaded image
-//   dimensions. Otherwise the image is scaled to fit the rectangle.
-ed_node *
-ed_image_button(const unsigned char *image, int w, int h, ed_pixel_format fmt,
-        void (*onclick)(ed_node *node), ed_rect rect)
-{
-    ed_node *node = ed_begin_button(onclick, rect);
-    ed_image(image, w, h, fmt, rect);
-    ed_end();
     return node;
 }
 
@@ -3190,7 +3278,7 @@ ed_image_button(const unsigned char *image, int w, int h, ed_pixel_format fmt,
 void
 ed_image_buffer_copy(ed_node *node, const unsigned char *src)
 {
-    constexpr float one_over_255 = 1.0f / 255.0f;
+    const float one_over_255 = 1.0f / 255.0f;
 
     assert(node->value_type == ED_DIB);
     assert(node->value_dib_image);
@@ -3287,11 +3375,11 @@ ed_image_buffer_clear(ed_node *node,
 
 // Returns the currently focused node, or NULL if no node has focus.
 ed_node *
-ed_get_focus()
+ed_get_focus(void)
 {
     HWND hwnd = GetFocus();
     if (hwnd) {
-        return (ed_node *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+        return (ed_node *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
     }
 
     return NULL;
@@ -3463,7 +3551,7 @@ void
 ed_readonly(ed_node *node)
 {
     node->flags |= ED_READONLY;
-    SendMessage(ed_hwnd(node), EM_SETREADONLY, TRUE, 0);
+    SendMessageA(ed_hwnd(node), EM_SETREADONLY, TRUE, 0);
 
     if (node->node_list) {
         ed_readonly(node->node_list);
@@ -3476,9 +3564,14 @@ void
 ed_readwrite(ed_node *node)
 {
     node->flags &= ~ED_READONLY;
-    SendMessage(ed_hwnd(node), EM_SETREADONLY, FALSE, 0);
+    SendMessageA(ed_hwnd(node), EM_SETREADONLY, FALSE, 0);
 
     if (node->node_list) {
         ed_readwrite(node->node_list);
     }
 }
+
+#undef ed_abs
+#undef ed_min
+#undef ed_max
+#undef ed_clamp

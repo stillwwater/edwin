@@ -31,7 +31,7 @@ WindowProc(HWND hwnd, UINT u_msg, WPARAM w_param, LPARAM l_param)
 void
 test_rect(ed_rect rect)
 {
-    ed_begin_border(rect);
+    ed_begin_border(ED_VERT, rect.x, rect.y, rect.w, rect.h);
     ed_end();
 }
 
@@ -57,25 +57,25 @@ WinMain(HINSTANCE hinstance, HINSTANCE, LPSTR, int cmdshow)
     ShowWindow(hwnd, cmdshow);
 
     ed_init(hwnd);
-    ed_begin_window("Everything", {0, 0, 0.4f, 1});
+    ed_begin_window("Everything", ED_VERT, 0, 0, 0.4f, 1);
     {
-        ed_begin_border({0, 0, 1, 0});
+        ed_begin_border(ED_VERT, 0, 0, 1, 0);
         {
             ed_label("Below are all edwin controls");
         }
         ed_end();
 
-        ed_begin_group("All Controls");
+        ed_begin_group("All Controls", ED_VERT, 0, 0, 1, 0);
         {
             ed_button("Button", NULL);
             ed_space(20);
-            ed_string("String");
-            ed_int("Int");
-            ed_data(ed_int("Hex Int", 0, 0, "0x%X"), scratch[si++]);
-            ed_float("Float");
+            ed_input("String", ED_STRING);
+            ed_input("Int", ED_INT);
+            ed_data(ed_int_fmt("Hex Int", 0, 0, "0x%08X", 16), scratch[si++]);
+            ed_input("Float", ED_FLOAT);
             ed_float("Float Slider", 0, 1);
-            ed_int64("Int64");
-            ed_float64("Float64");
+            ed_input("Int64", ED_INT64);
+            ed_input("Float64", ED_FLOAT64);
             ed_data(ed_enum("Enum", options, 4), scratch[si++]);
             ed_data(ed_flags("Flags", options, 4), scratch[si++]);
             ed_data(ed_bool("Bool"), scratch[si++]);
@@ -83,13 +83,22 @@ WinMain(HINSTANCE hinstance, HINSTANCE, LPSTR, int cmdshow)
             ed_vector("Vector", ED_FLOAT, 3);
             ed_matrix("Matrix", ED_FLOAT, 3, 3);
             ed_color("Color");
-            ed_image((unsigned char *)scratch[si++], 1, 1, ED_RGB, {1, 0, 128, 128});
+
+            unsigned image[32 * 32];
+            for (unsigned y = 0; y < 32; ++y) {
+                for (unsigned x = 0; x < 32; ++x) {
+                    image[x + y * 32] = 0xFFFF0000 | ((8 * y) << 8) | (8 * x);
+                }
+            }
+
+            ed_push_rect(1.0f, 0, 128, 128);
+            ed_image_buffer((unsigned char *)image, 32, 32, ED_RGBA);
         }
         ed_end();
 
-        ed_begin_group("Group");
+        ed_begin_group("Group", ED_VERT, 0, 0, 1, 0);
         {
-            ed_begin_border({0, 0, 1, 0});
+            ed_begin_border(ED_VERT, 0, 0, 1, 0);
             {
                 ed_label("That's all");
             }
@@ -99,20 +108,20 @@ WinMain(HINSTANCE hinstance, HINSTANCE, LPSTR, int cmdshow)
     }
     ed_end();
 
-    ed_begin_window("Layout Test", {1, 0, 0.6f, 1});
+    ed_begin_window("Layout Test", ED_VERT, 1, 0, 0.6f, 1);
     {
-        ed_begin_border({0, 0, 1.0f, 0});
+        ed_begin_border(ED_VERT, 0, 0, 1.0f, 0);
         {
             test_rect({0, 0, 1.0, 30});
             test_rect({0, 0, 1.0, 20});
-            ed_begin_border({0, 0, 1.0f, 0}, ED_HORZ);
+            ed_begin_border(ED_HORZ, 0, 0, 1.0f, 0);
             {
                 test_rect({0, 0, 0.333f, 20});
                 test_rect({0, 0, 0.333f, 20});
                 test_rect({0, 0, 0.333f, 20});
             }
             ed_end();
-            ed_begin_border({0, 0, 1.0f, 0}, ED_HORZ);
+            ed_begin_border(ED_HORZ, 0, 0, 1.0f, 0);
             {
                 test_rect({0, 0, 1, 20});
                 test_rect({0, 0, 50, 20});
@@ -121,16 +130,16 @@ WinMain(HINSTANCE hinstance, HINSTANCE, LPSTR, int cmdshow)
             ed_end();
         }
         ed_end();
-        ed_begin_border({0, 0, 1.0, 1.0});
+        ed_begin_border(ED_VERT, 0, 0, 1.0, 1.0);
         {
-            ed_begin_border({0, 0, 1.0, 0}, ED_HORZ);
+            ed_begin_border(ED_HORZ, 0, 0, 1.0f, 0);
             {
                 test_rect({0, 0, 20, 20});
                 test_rect({0, 0, 1.0, 20});
                 test_rect({0, 0, 20, 20});
             }
             ed_end();
-            ed_begin_border({0, 0, 1, 1}, ED_ABS);
+            ed_begin_border(ED_ABS, 0, 0, 1, 1);
             {
                 test_rect({0, 0, 40, 40});
                 test_rect({1, 0, 40, 40});
@@ -143,7 +152,7 @@ WinMain(HINSTANCE hinstance, HINSTANCE, LPSTR, int cmdshow)
                 test_rect({0.5, 0.5, 40, 40});
             }
             ed_end();
-            ed_begin_border({0, 0, 1.0, 0}, ED_HORZ);
+            ed_begin_border(ED_HORZ, 0, 0, 1.0, 0);
             {
                 test_rect({0, 0, 20, 20});
                 test_rect({0, 0, 1.0, 20});

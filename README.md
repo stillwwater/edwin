@@ -1,7 +1,9 @@
 Edwin
 =====
 
-A small graphical user interface library for creating debug tools for Windows applications.
+A small C/C++ graphical user interface library for creating debug editors for
+Windows applications. Variables can be bound to input controls to modify them,
+making exposed variables easy to tweak at runtime.
 
 ![demo screenshot](res/screen.png)
 
@@ -28,14 +30,15 @@ count_onclick(ed_node *button)
 void
 counter_example()
 {
-    // Create a centered window.
-    ed_begin_window("Example", {0.5f, 0.5f, 200, 100});
+    // Create a centered 200x100 window.
+    ed_begin_window("Example", ED_VERT, 0.5f, 0.5f, 200, 100);
     {
         // Create a labeled input field.
-        counter = ed_int("Counter");
+        counter = ed_input("Counter", ED_INT);
 
         // Create a button taking up 100% of the parent width.
-        ed_button("Count", count_onclick, {0, 0, 1, 0});
+        ed_push_rect(0, 0, 1.0f, 0);
+        ed_button("Count", count_onclick);
     }
     ed_end();
 }
@@ -44,9 +47,10 @@ counter_example()
 Installation
 ------------
 
-Build `edwin.cpp` and link it with your executable. Requires a C++ 17 compiler or newer.
+Build `edwin.c` and link it with your executable. `edwin.c` uses a subset of C
+which can be compiled with either a C99 or C++ compiler.
 
 ~~~
-cl /W4 /std:c++20 /c edwin.cpp
+cl /W4 /std:c11 /c edwin.c
 link /subsystem:windows user32.lib gdi32.lib comctl32.lib msimg32.lib edwin.obj your_app.obj
 ~~~

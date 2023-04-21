@@ -1,7 +1,8 @@
-#include <stddef.h>
+#ifndef EDWIN_H
+#define EDWIN_H
 
-#ifndef EDWIN_H_
-#define EDWIN_H_
+#include <stddef.h>
+#include <stdbool.h>
 
 #define ED_VERSION 2302
 
@@ -11,6 +12,10 @@
 
 #ifndef ED_NODE_COUNT
 #define ED_NODE_COUNT (ED_TREE_MEMORY / sizeof(ed_node))
+#endif
+
+#ifndef ED_RECT_STACK_SIZE
+#define ED_RECT_STACK_SIZE 32
 #endif
 
 #ifndef ED_UPDATE_FUNCS_COUNT
@@ -27,13 +32,13 @@
 #define ed_read_value(Type, value) (*(Type *)(value))
 #define ed_write_value(Type, dst, src) (*(Type *)(dst) = *(Type *)src)
 
-enum ed_node_layout {
+typedef enum ed_node_layout {
     ED_VERT,
     ED_HORZ,
     ED_ABS,
-};
+} ed_node_layout;
 
-enum ed_node_type {
+typedef enum ed_node_type {
     ED_NONE,
     ED_BLOCK,
     ED_WINDOW,
@@ -53,9 +58,9 @@ enum ed_node_type {
     ED_COLORPICKER,
 
     ED_NODE_TYPE_USER = 0x8000,
-};
+} ed_node_type;
 
-enum ed_value_type {
+typedef enum ed_value_type {
     ED_STRING,
     ED_INT,
     ED_FLOAT,
@@ -74,7 +79,7 @@ enum ed_value_type {
     ED_VALUE_TYPE_SCALAR_MIN = ED_INT,
     ED_VALUE_TYPE_SCALAR_MAX = ED_BOOL,
     ED_VALUE_TYPE_COUNT,
-};
+} ed_value_type;
 
 enum ed_node_flags {
     ED_ROOT        = 0x00000001,
@@ -101,31 +106,31 @@ enum ed_color {
     ED_COLOR_COUNT,
 };
 
-enum ed_pixel_format {
+typedef enum ed_pixel_format {
     ED_RGB,
     ED_BGR,
     ED_ARGB,
     ED_RGBA,
     ED_ABGR,
     ED_BGRA,
-};
+} ed_pixel_format;
 
 struct ed_style {
-    short spacing = 8;
-    short padding = 8;
-    short border_size = 1;
-    short scrollbar_size = 15;
-    short text_w_spacing = 20;
-    short text_h_spacing = 10;
-    short caption_height = 26;
-    short scroll_sensitivity = 8;
-    short scroll_unit = 15;
-    short number_input_deadzone = 3;
-    float label_width = 0.4f;
-    float label_height = 20.0f;
-    float input_height = 20.0f;
-    float number_input_float_increment = 0.01f;
-    double number_input_float64_increment = 0.01;
+    short spacing;
+    short padding;
+    short border_size;
+    short scrollbar_size;
+    short text_w_spacing;
+    short text_h_spacing;
+    short caption_height;
+    short scroll_sensitivity;
+    short scroll_unit;
+    short number_input_deadzone;
+    float label_width;
+    float label_height;
+    float input_height;
+    float number_input_float_increment;
+    double number_input_float64_increment;
 
     int colors[ED_COLOR_COUNT]; // Colors are in BGR format
     const char *value_formats[ED_VALUE_TYPE_COUNT];
@@ -147,26 +152,26 @@ struct ed_style {
 // `{0.5f, 0.5f, 100, 0}`: A 100px wide centered element. The height will be
 // determined by this element's children, or text size in the case of buttons,
 // labels and inputs.
-struct ed_rect {
+typedef struct ed_rect {
     float x, y, w, h;
-};
+} ed_rect;
 
-struct ed_dst {
+typedef struct ed_dst {
     short x, y, w, h;
-};
+} ed_dst;
 
-struct ed_bounds {
+typedef struct ed_bounds {
     short w, h;
-};
+} ed_bounds;
 
-struct ed_bitmap_buffer {
+typedef struct ed_bitmap_buffer {
     ed_pixel_format fmt;
     short w, h;
-};
+} ed_bitmap_buffer;
 
-struct ed_node {
-    ed_node *parent, *child;
-    ed_node *before, *after;
+typedef struct ed_node {
+    struct ed_node *parent, *child;
+    struct ed_node *before, *after;
 
     void *hwnd;            // Window handle
 
@@ -199,20 +204,20 @@ struct ed_node {
         unsigned char *value_dib_image;
     };
 
-    ed_node *node_list;    // List of nodes used to chain related nodes
+    struct ed_node *node_list;    // List of nodes used to chain related nodes
 
     union {
-        void (*onclick)(ed_node *node);
-        void (*onchange)(ed_node *node);
+        void (*onclick)(struct ed_node *node);
+        void (*onchange)(struct ed_node *node);
     };
 
     void *user_data;
-};
+} ed_node;
 
-struct ed_node_update {
+typedef struct ed_node_update {
     ed_node *node;
-    void (*update)();
-};
+    void (*update)(void);
+} ed_node_update;
 
 struct ed_stats {
     // Number of calls to ed_invalidate.
@@ -237,74 +242,81 @@ struct ed_stats {
     long long update_ticks;
 };
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 ed_node *ed_index_node(short id);
 void ed_init(void *hwnd);
-void ed_deinit();
-void ed_register_update(ed_node *node, void (*update)());
+void ed_deinit(void);
+void ed_register_update(ed_node *node, void (*update)(void));
 void ed_unregister_update(ed_node *node);
 void ed_update(unsigned update_every_n_frames);
-void ed_apply_system_colors();
-void ed_allocate_colors();
+void ed_apply_system_colors(void);
+void ed_allocate_colors(void);
 void ed_resize(void *hwnd);
 void ed_invalidate(ed_node *node);
 void ed_invalidate_data(ed_node *node);
-void ed_data(ed_node *node, void *data, size_t size = 0);
+void ed_str_data(ed_node *node, void *data, size_t size);
+void ed_data(ed_node *node, void *data);
 
 void ed_begin_context(ed_node *node);
-void ed_end_context();
+void ed_end_context(void);
 void ed_insert_after(ed_node *node);
 void ed_remove(ed_node *node);
 void ed_attach_hwnd(ed_node *node, const char *class_name, const char *name, int flags);
+void ed_push_rect(float x, float y, float w, float h);
+ed_rect ed_pop_rect(float x, float y, float w, float h);
 
 // Parent controls
 
-ed_node *ed_begin(ed_rect rect = {}, ed_node_layout layout = ED_VERT);
-ed_node *ed_begin_border(ed_rect rect = {}, ed_node_layout layout = ED_VERT);
-ed_node *ed_begin_scroll(ed_rect rect = {0, 0, 1.0f, 1.0f}, ed_node_layout layout = ED_VERT);
-ed_node *ed_begin_window(const char *name, ed_rect rect = {}, ed_node_layout = ED_VERT);
-ed_node *ed_begin_group(const char *name, ed_rect rect = {0, 0, 1.0f, 0}, ed_node_layout layout = ED_VERT);
-ed_node *ed_begin_button(void (*onclick)(ed_node *node), ed_rect rect = ed_rect{});
-ed_node *ed_begin_hwnd(void *hwnd, ed_node_layout layout = ED_VERT);
-void ed_end();
+ed_node *ed_begin(ed_node_layout layout, float x, float y, float w, float h);
+ed_node *ed_begin_border(ed_node_layout layout, float x, float y, float w, float h);
+ed_node *ed_begin_scroll(ed_node_layout layout);
+ed_node *ed_begin_window(const char *name, ed_node_layout layout, float x, float y, float w, float h);
+ed_node *ed_begin_group(const char *name, ed_node_layout layout, float x, float y, float w, float h);
+ed_node *ed_begin_button(float x, float y, float w, float h, void (*onclick)(ed_node *node));
+ed_node *ed_begin_hwnd(void *hwnd, ed_node_layout layout);
+void ed_end(void);
 
 // Basic controls
 
-ed_node *ed_label(const char *label, ed_rect rect = {});
-ed_node *ed_button(const char *label, void (*onclick)(ed_node *node), ed_rect rect = {});
+ed_node *ed_label(const char *label);
+ed_node *ed_button(const char *label, void (*onclick)(ed_node *node));
 ed_node *ed_space(float size);
-ed_node *ed_separator();
+ed_node *ed_separator(void);
 
 // Input controls
 
-ed_node *ed_input(ed_value_type type, ed_rect rect = {0, 0, 1.0f, 0});
-ed_node *ed_input(const char *label, ed_value_type type, ed_rect rect = {0, 0, 1.0f, 0});
-ed_node *ed_string(const char *label, ed_rect rect = {0, 0, 1.0f, 0});
-ed_node *ed_int(const char *label, int value_min = 0, int value_max = 0, const char *fmt = NULL, int base = 0, ed_rect rect = {0, 0, 1.0f, 0});
-ed_node *ed_float(const char *label, float value_min = 0, float value_max = 0, const char *fmt = NULL, ed_rect rect = {0, 0, 1.0f, 0});
-ed_node *ed_int64(const char *label, long long value_min = 0, long long value_max = 0, const char *fmt = NULL, int base = 0, ed_rect rect = {0, 0, 1.0f, 0});
-ed_node *ed_float64(const char *label, double value_min = 0.0, double value_max = 0.0, const char *fmt = NULL, ed_rect rect = {0, 0, 1.0f, 0});
-ed_node *ed_enum(const char *label, const char **items, size_t items_count, ed_rect rect = {0, 0, 1.0f, 0});
-ed_node *ed_flags(const char *label, const char **items, size_t items_count, ed_rect rect = {0, 0, 1.0f, 0});
-ed_node *ed_bool(const char *label, ed_rect rect = {0, 0, 1.0f, 0});
-ed_node *ed_text(const char *label, ed_rect rect = {0, 0, 1.0f, 150});
-ed_node *ed_vector(const char *label, ed_value_type value_type, size_t n, ed_rect rect = {0, 0, 1.0f, 0});
-ed_node *ed_matrix(const char *label, ed_value_type value_type, size_t m, size_t n, bool transpose = false, ed_rect rect = {0, 0, 1.0f, 0});
-ed_node *ed_color(const char *label, ed_rect rect = {0, 0, 1.0f, 0});
+ed_node *ed_input(const char *label, ed_value_type type);
+ed_node *ed_int(const char *label, int value_min, int value_max);
+ed_node *ed_int_fmt(const char *label, int value_min, int value_max, const char *fmt, int base);
+ed_node *ed_float(const char *label, float value_min, float value_max);
+ed_node *ed_int64(const char *label, long long value_min, long long value_max);
+ed_node *ed_int64_fmt(const char *label, long long value_min, long long value_max, const char *fmt, int base);
+ed_node *ed_float64(const char *label, double value_min, double value_max);
+ed_node *ed_enum(const char *label, const char **items, size_t items_count);
+ed_node *ed_flags(const char *label, const char **items, size_t items_count);
+ed_node *ed_bool(const char *label);
+ed_node *ed_text(const char *label);
+ed_node *ed_vector(const char *label, ed_value_type value_type, size_t n);
+ed_node *ed_matrix(const char *label, ed_value_type value_type, size_t m, size_t n);
+ed_node *ed_matrix_row(const char *label, ed_value_type value_type, size_t m, size_t n);
+ed_node *ed_color(const char *label);
 
 // Image controls
 
-ed_node *ed_image(const char *filename, ed_rect rect = {});
-ed_node *ed_image(const unsigned char *image, int w, int h, ed_pixel_format fmt, ed_rect rect = {});
-ed_node *ed_image_button(const char *filename, void (*onclick)(ed_node *node), ed_rect rect = {});
-ed_node *ed_image_button(const unsigned char *image, int w, int h, ed_pixel_format fmt, void (*onclick)(ed_node *node), ed_rect rect = {});
+ed_node *ed_image(const char *filename);
+ed_node *ed_image_buffer(const unsigned char *image, int w, int h, ed_pixel_format fmt);
+ed_node *ed_image_button(const char *filename, void (*onclick)(ed_node *node));
 
 void ed_image_buffer_copy(ed_node *node, const unsigned char *src);
 void ed_image_buffer_clear(ed_node *node, unsigned char r, unsigned char g, unsigned char b, unsigned char a);
 
 // Node state
 
-ed_node *ed_get_focus();
-bool ed_is_mouse_over(ed_node *node = NULL);
+ed_node *ed_get_focus(void);
+bool ed_is_mouse_over(ed_node *node);
 bool ed_is_visible(ed_node *node);
 bool ed_is_enabled(ed_node *node);
 
@@ -327,6 +339,8 @@ extern struct ed_stats ed_stats;
 extern ed_node ed_tree[ED_NODE_COUNT];
 extern ed_node_update ed_update_funcs[ED_UPDATE_FUNCS_COUNT];
 
-static_assert(ED_NODE_COUNT < 0x7FFF);
+#ifdef __cplusplus
+} // extern "C"
+#endif
 
-#endif // EDWIN_H_
+#endif // EDWIN_H
